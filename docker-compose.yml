@@ -1,0 +1,70 @@
+services:
+  app:
+    build:
+      context: ./laravel-app
+    container_name: vehicle-counter-app
+    command: ["serve"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - app_database:/var/www/html/database
+      - videos_data:/var/www/html/storage/app/videos
+    environment:
+      APP_URL: "${APP_URL:-http://localhost:8000}"
+      APP_KEY: "${APP_KEY:-}"
+      DETECTOR_SERVICE_URL: "http://detector:8001"
+      DETECTOR_CALLBACK_SECRET: "${DETECTOR_CALLBACK_SECRET:-change-me-secret}"
+      DANGER_DWELL_SECONDS: "${DANGER_DWELL_SECONDS:-5}"
+      ADMIN_EMAIL: "${ADMIN_EMAIL:-}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
+      ADMIN_NAME: "${ADMIN_NAME:-Administrator}"
+    depends_on:
+      - detector
+    networks:
+      - vehicle-counter
+
+  queue:
+    build:
+      context: ./laravel-app
+    container_name: vehicle-counter-queue
+    command: ["queue"]
+    volumes:
+      - app_database:/var/www/html/database
+      - videos_data:/var/www/html/storage/app/videos
+    environment:
+      APP_URL: "${APP_URL:-http://localhost:8000}"
+      APP_KEY: "${APP_KEY:-}"
+      DETECTOR_SERVICE_URL: "http://detector:8001"
+      DETECTOR_CALLBACK_SECRET: "${DETECTOR_CALLBACK_SECRET:-change-me-secret}"
+      DANGER_DWELL_SECONDS: "${DANGER_DWELL_SECONDS:-5}"
+      ADMIN_EMAIL: "${ADMIN_EMAIL:-}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
+      ADMIN_NAME: "${ADMIN_NAME:-Administrator}"
+    depends_on:
+      - detector
+      - app
+    networks:
+      - vehicle-counter
+
+  detector:
+    build:
+      context: ./detector-service
+    container_name: vehicle-counter-detector
+    ports:
+      - "127.0.0.1:8001:8001"
+    volumes:
+      - videos_data:/data/videos
+    environment:
+      CALLBACK_SECRET: "${DETECTOR_CALLBACK_SECRET:-change-me-secret}"
+      MODEL_NAME: "${MODEL_NAME:-yolov8n.pt}"
+      DANGER_DWELL_SECONDS: "${DANGER_DWELL_SECONDS:-5}"
+    networks:
+      - vehicle-counter
+
+networks:
+  vehicle-counter:
+    driver: bridge
+
+volumes:
+  videos_data:
+  app_database:
