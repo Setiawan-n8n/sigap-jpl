@@ -4,8 +4,6 @@ services:
       context: ./laravel-app
     container_name: vehicle-counter-app
     command: ["serve"]
-    ports:
-      - "127.0.0.1:8000:8000"
     volumes:
       - app_database:/var/www/html/database
       - videos_data:/var/www/html/storage/app/videos
@@ -50,8 +48,6 @@ services:
     build:
       context: ./detector-service
     container_name: vehicle-counter-detector
-    ports:
-      - "127.0.0.1:8001:8001"
     volumes:
       - videos_data:/data/videos
     environment:
