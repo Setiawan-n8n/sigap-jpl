@@ -1,6 +1,6 @@
 import os
 
-MODEL_NAME = os.getenv("MODEL_NAME", "yolov8n.pt")
+MODEL_NAME = os.getenv("MODEL_NAME", "yolov8s.pt")
 CALLBACK_SECRET = os.getenv("CALLBACK_SECRET", "change-me-secret")
 CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.35"))
 DEFAULT_DANGER_DWELL_SECONDS = float(os.getenv("DANGER_DWELL_SECONDS", "5"))

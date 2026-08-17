@@ -15,8 +15,13 @@ RUN pip install --no-cache-dir torch==2.3.1 torchvision==0.18.1 --index-url http
 
 COPY app ./app
 
-# Unduh bobot model YOLOv8n saat build agar tidak perlu akses internet saat runtime.
-RUN python -c "import torch; _orig = torch.load; torch.load = lambda *a, **k: _orig(*a, **{**k, 'weights_only': False}); from ultralytics import YOLO; YOLO('yolov8n.pt')"
+# Unduh bobot model YOLOv8s saat build agar tidak perlu akses internet saat
+# runtime. Pakai varian "s" (small), bukan "n" (nano) -- nano sering
+# salah-klasifikasi objek kecil/sekilas-muncul/terhalang (mis. motor parkir
+# terbaca "person") karena akurasinya memang paling rendah di keluarga
+# YOLOv8. "s" jauh lebih akurat dengan konsekuensi inferensi ~3x lebih
+# lambat (VPS ini CPU-only, tidak ada GPU).
+RUN python -c "import torch; _orig = torch.load; torch.load = lambda *a, **k: _orig(*a, **{**k, 'weights_only': False}); from ultralytics import YOLO; YOLO('yolov8s.pt')"
 
 EXPOSE 8001
 
