@@ -7,7 +7,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /srv
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install CPU-only PyTorch dulu (VPS ini tidak punya GPU). Tanpa ini, pip akan
+# menarik build CUDA yang jauh lebih besar (ratusan MB paket nvidia-*) yang
+# sama sekali tidak terpakai dan bikin build lambat/rawan gagal.
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
