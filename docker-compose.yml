@@ -5,11 +5,12 @@ services:
     container_name: vehicle-counter-app
     command: ["serve"]
     volumes:
-      - app_database:/var/www/html/database
+      - app_database:/var/www/html/database/data
       - videos_data:/var/www/html/storage/app/videos
     environment:
       APP_URL: "${APP_URL:-http://localhost:8000}"
       APP_KEY: "${APP_KEY:-}"
+      DB_DATABASE: "/var/www/html/database/data/database.sqlite"
       DETECTOR_SERVICE_URL: "http://detector:8001"
       DETECTOR_CALLBACK_SECRET: "${DETECTOR_CALLBACK_SECRET:-change-me-secret}"
       DANGER_DWELL_SECONDS: "${DANGER_DWELL_SECONDS:-5}"
@@ -25,11 +26,12 @@ services:
     container_name: vehicle-counter-queue
     command: ["queue"]
     volumes:
-      - app_database:/var/www/html/database
+      - app_database:/var/www/html/database/data
       - videos_data:/var/www/html/storage/app/videos
     environment:
       APP_URL: "${APP_URL:-http://localhost:8000}"
       APP_KEY: "${APP_KEY:-}"
+      DB_DATABASE: "/var/www/html/database/data/database.sqlite"
       DETECTOR_SERVICE_URL: "http://detector:8001"
       DETECTOR_CALLBACK_SECRET: "${DETECTOR_CALLBACK_SECRET:-change-me-secret}"
       DANGER_DWELL_SECONDS: "${DANGER_DWELL_SECONDS:-5}"

@@ -19,8 +19,8 @@ COPY --from=vendor /usr/bin/composer /usr/bin/composer
 
 RUN composer dump-autoload --optimize --no-scripts \
     && mkdir -p storage/framework/cache storage/framework/sessions storage/framework/views \
-       storage/logs storage/app/videos/results/snapshots database bootstrap/cache \
-    && touch database/database.sqlite \
+       storage/logs storage/app/videos/results/snapshots database/data bootstrap/cache \
+    && touch database/data/database.sqlite \
     && chmod -R 775 storage bootstrap/cache database
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh

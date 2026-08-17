@@ -16,8 +16,8 @@ if [ -z "${APP_KEY:-}" ]; then
     fi
 fi
 
-mkdir -p storage/app/videos/results/snapshots database
-touch database/database.sqlite
+mkdir -p storage/app/videos/results/snapshots database/data
+touch database/data/database.sqlite
 
 php artisan migrate --force
 
