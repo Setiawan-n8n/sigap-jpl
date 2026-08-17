@@ -30,7 +30,7 @@ from .config import (
     DEFAULT_DANGER_DWELL_SECONDS,
     MODEL_NAME,
     RIDER_HOST_CLASSES,
-    RIDER_OVERLAP_THRESHOLD,
+    RIDER_X_MARGIN_RATIO,
     TARGET_CLASSES,
     TRAIL_LENGTH,
 )
@@ -104,19 +104,24 @@ def _sanitize(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower() or "zona"
 
 
-def _overlap_ratio(box_a, box_b) -> float:
-    """Rasio luas irisan terhadap luas box_a (0..1). Dipakai untuk menebak
-    apakah sebuah deteksi "person" kemungkinan besar pengendara/penumpang
-    kendaraan (box orang-nya tumpang tindih signifikan dengan box kendaraan),
-    bukan pejalan kaki lepas."""
-    ax1, ay1, ax2, ay2 = box_a
-    bx1, by1, bx2, by2 = box_b
-    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
-    inter = iw * ih
-    area_a = max(1e-6, (ax2 - ax1) * (ay2 - ay1))
-    return inter / area_a
+def _is_riding(person_box, vehicle_box) -> bool:
+    """Cek apakah box "person" kemungkinan besar pengendara/penumpang dari
+    box kendaraan tsb (lihat penjelasan RIDER_X_MARGIN_RATIO di config.py).
+    Sengaja tidak memakai rasio luas irisan -- box orang biasanya jauh lebih
+    tinggi dari box motor (mencakup kepala & badan atas), jadi irisan
+    areanya kecil walau orangnya jelas sedang menaiki motor tsb."""
+    px1, _py1, px2, py2 = person_box
+    vx1, vy1, vx2, vy2 = vehicle_box
+
+    person_cx = (px1 + px2) / 2.0
+    v_width = max(1e-6, vx2 - vx1)
+    x_margin = v_width * RIDER_X_MARGIN_RATIO
+    if not (vx1 - x_margin <= person_cx <= vx2 + x_margin):
+        return False
+
+    # Harus ada irisan vertikal (badan orang menumpuk di atas kendaraan),
+    # bukan sekadar sejajar secara horizontal padahal beda posisi jauh.
+    return py2 >= vy1 and _py1 <= vy2
 
 
 def _parse_recorded_at(value: Optional[str]) -> datetime:
@@ -219,7 +224,7 @@ def _run_detection(req: ProcessRequest):
                 for tid, cn, box in frame_boxes:
                     if cn != "person" or tid in rider_track_ids:
                         continue
-                    if any(_overlap_ratio(box, vbox) >= RIDER_OVERLAP_THRESHOLD for vbox in vehicle_boxes):
+                    if any(_is_riding(box, vbox) for vbox in vehicle_boxes):
                         rider_track_ids.add(tid)
 
             for track_id, class_name, box in frame_boxes:

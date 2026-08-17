@@ -22,10 +22,16 @@ TARGET_CLASSES = {
 # angka "Orang" tidak dobel-hitung dengan "Motor"/"Mobil"/dst.
 RIDER_HOST_CLASSES = {"bicycle", "motorcycle", "car", "bus", "truck"}
 
-# Seberapa besar porsi bounding box "person" yang harus tertutup oleh
-# bounding box kendaraan (0..1) supaya orang tsb dianggap pengendara/
-# penumpang, bukan pejalan kaki. Makin kecil nilainya, makin agresif
-# mengecualikan orang di dekat kendaraan (risiko pejalan kaki yang lewat
-# tepat di samping motor ikut ter-exclude); makin besar, makin longgar
-# (risiko pengendara tetap kehitung sebagai pejalan kaki).
-RIDER_OVERLAP_THRESHOLD = float(os.getenv("RIDER_OVERLAP_THRESHOLD", "0.3"))
+# Deteksi "orang ini menumpang kendaraan itu" memakai dua syarat geometris,
+# BUKAN rasio luas irisan (rasio luas terlalu ketat -- box orang biasanya
+# jauh lebih tinggi daripada box motor karena mencakup kepala & badan atas,
+# jadi irisannya kecil walau orangnya jelas-jelas duduk di atas motor):
+#
+# 1. Pusat horizontal (center-x) box orang harus berada di dalam rentang-x
+#    box kendaraan, dengan sedikit toleransi (RIDER_X_MARGIN_RATIO x lebar
+#    kendaraan) -- pengendara selalu duduk/berdiri tepat di atas
+#    kendaraannya secara horizontal, terlepas dari seberapa besar box-nya.
+# 2. Harus ada irisan vertikal (sekecil apa pun) antara kedua box -- badan
+#    orang menumpuk di atas/bersinggungan dengan body kendaraan, bukan
+#    berdiri terpisah di tanah.
+RIDER_X_MARGIN_RATIO = float(os.getenv("RIDER_X_MARGIN_RATIO", "0.25"))
