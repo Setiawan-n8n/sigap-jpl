@@ -50,7 +50,7 @@ services:
       - videos_data:/data/videos
     environment:
       CALLBACK_SECRET: "${DETECTOR_CALLBACK_SECRET:-change-me-secret}"
-      MODEL_NAME: "${MODEL_NAME:-yolov8n.pt}"
+      MODEL_NAME: "${MODEL_NAME:-yolov8s.pt}"
       DANGER_DWELL_SECONDS: "${DANGER_DWELL_SECONDS:-5}"
 
 volumes:
