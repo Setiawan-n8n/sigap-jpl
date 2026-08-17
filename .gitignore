@@ -1,0 +1,33 @@
+# Video test/upload lokal -- ini file data, bukan source code. Jangan pernah
+# ikut ter-commit (sempat ke-commit tanpa sengaja karena .gitignore ini belum
+# ada sebelumnya).
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Laravel
+laravel-app/vendor/
+laravel-app/node_modules/
+laravel-app/.env
+laravel-app/storage/framework/cache/*
+laravel-app/storage/framework/sessions/*
+laravel-app/storage/framework/views/*
+laravel-app/storage/logs/*
+laravel-app/storage/app/videos/*
+laravel-app/database/database.sqlite
+laravel-app/bootstrap/cache/*.php
+!laravel-app/storage/framework/cache/.gitignore
+!laravel-app/storage/framework/sessions/.gitignore
+!laravel-app/storage/framework/views/.gitignore
+!laravel-app/storage/logs/.gitignore
+!laravel-app/storage/app/videos/.gitignore
+
+# Python
+detector-service/**/__pycache__/
+detector-service/**/*.pyc
+detector-service/.venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
