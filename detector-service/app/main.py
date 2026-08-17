@@ -168,7 +168,6 @@ def _run_detection(req: ProcessRequest):
 
     output_filename = f"{req.job_id}_annotated.mp4"
     output_path = os.path.join(results_dir, output_filename)
-    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
 
     base_dt = _parse_recorded_at(req.recorded_at)
     trails: dict = defaultdict(lambda: deque(maxlen=TRAIL_LENGTH))
@@ -179,6 +178,19 @@ def _run_detection(req: ProcessRequest):
     # berubah-ubah antar frame hanya karena sudut kamera/oklusi sesaat).
     rider_track_ids: set = set()
 
+    # =====================================================================
+    # TAHAP 1 -- Deteksi & tracking penuh atas seluruh video.
+    #
+    # Kelas hasil YOLO untuk SATU track yang sama kadang "kedip" antar frame
+    # (mis. sebuah motor sesaat terbaca "person"/"car" sebelum benar terbaca
+    # "motorcycle" beberapa frame kemudian -- padahal track ID-nya tetap).
+    # Kalau video langsung digambar & ditulis sambil jalan (satu-pass, seperti
+    # sebelumnya), label yang tampil di video ikut kedip mengikuti kesalahan
+    # itu. Makanya deteksi dipisah jadi dua tahap: tahap ini HANYA mengoleksi
+    # semua deteksi mentah per frame (tanpa menggambar apa pun), supaya
+    # ZoneTracker sempat mengumpulkan "suara" tiap track dari SELURUH video
+    # dan tahu kelas final (mayoritas) tiap track sebelum video digambar.
+    # =====================================================================
     results = model.track(
         source=req.video_path,
         classes=wanted_ids,
@@ -189,28 +201,17 @@ def _run_detection(req: ProcessRequest):
         verbose=False,
     )
 
+    all_frame_detections: list = []  # index = frame_idx -> list[(track_id, class_name, box)]
+
     frame_idx = 0
     for result in results:
-        frame = result.orig_img.copy()
-        overlay = frame.copy()
-
-        # --- Gambar zona (poligon) sebagai layer transparan ---
-        for zone, zs in zip(zones, req.zones):
-            color = zone_colors[zone.name]
-            pts = zone.polygon.astype(int).reshape((-1, 1, 2))
-            if zone.type == "danger":
-                cv2.fillPoly(overlay, [pts], color)
-            cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=2)
-        frame = cv2.addWeighted(overlay, 0.18, frame, 0.82, 0)
-
-        detections = []
+        frame_boxes = []  # (track_id, class_name, box)
         boxes = result.boxes
         if boxes is not None and boxes.id is not None:
             xyxy = boxes.xyxy.cpu().numpy()
             ids = boxes.id.cpu().numpy()
             cls_ids = boxes.cls.cpu().numpy()
 
-            frame_boxes = []  # (track_id, class_name, box)
             for box, tid, cls_id in zip(xyxy, ids, cls_ids):
                 class_name = TARGET_CLASSES.get(int(cls_id))
                 if class_name is None:
@@ -227,28 +228,87 @@ def _run_detection(req: ProcessRequest):
                     if any(_is_riding(box, vbox) for vbox in vehicle_boxes):
                         rider_track_ids.add(tid)
 
+            # Catat "suara" kelas & posisi tiap track untuk keperluan
+            # voting mayoritas & hitungan zona (lihat ZoneTracker.update).
+            zone_dets = []
             for track_id, class_name, box in frame_boxes:
-                if class_name == "person" and track_id in rider_track_ids:
-                    continue  # pengendara/penumpang -- jangan dihitung sebagai "Orang"
-
                 x1, y1, x2, y2 = box
                 cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                detections.append((track_id, class_name, cx, cy))
+                zone_dets.append((track_id, class_name, cx, cy))
+            new_events = zone_tracker.update(frame_idx, zone_dets)
+            safety_events_out.extend(new_events)
 
-                # --- Jejak lintasan (trail) ---
-                trails[track_id].append((int(cx), int(cy)))
-                color = track_color(track_id)
-                pts = list(trails[track_id])
-                for i in range(1, len(pts)):
-                    cv2.line(frame, pts[i - 1], pts[i], color, 2)
+        all_frame_detections.append(frame_boxes)
+        frame_idx += 1
 
-                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                cv2.putText(
-                    frame, f"{class_name}#{track_id}", (int(x1), max(0, int(y1) - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1,
-                )
+        # Tahap 1 dianggap porsi 0-70% dari progress total (paling berat,
+        # karena inferensi YOLO ada di sini). Tahap 2 (gambar & tulis video)
+        # jauh lebih ringan (tanpa inferensi model), diberi porsi 70-99%.
+        if progress_interval and frame_idx % progress_interval == 0:
+            pct = min(69, int(frame_idx / total_frames * 70)) if total_frames > 0 else 0
+            if pct != last_progress_sent:
+                _send_progress(req, pct)
+                last_progress_sent = pct
 
-        new_events = zone_tracker.update(frame_idx, detections)
+    total_frames_actual = len(all_frame_detections)
+
+    # Sekarang seluruh video sudah "dibaca suaranya" -- putuskan kelas final
+    # tiap event bahaya (safety event) memakai voting mayoritas juga, bukan
+    # cuma voting-sejauh-ini seperti kalau diputuskan di tengah proses.
+    events_by_frame: dict = defaultdict(list)
+    for ev in safety_events_out:
+        ev["class_name"] = zone_tracker._majority_class(ev["track_id"], ev["class_name"])
+        events_by_frame[ev["frame_idx"]].append(ev)
+
+    # =====================================================================
+    # TAHAP 2 -- Baca ulang video (tanpa inferensi YOLO lagi, jadi ringan)
+    # dan gambar kotak/label/jejak/OSD memakai kelas FINAL (mayoritas) tiap
+    # track, supaya label yang tampil di video konsisten dengan angka akhir
+    # di "Total per Kategori".
+    # =====================================================================
+    cap2 = cv2.VideoCapture(req.video_path)
+    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+
+    progress_interval_2 = max(1, total_frames_actual // 20) if total_frames_actual > 0 else 0
+
+    frame_idx = 0
+    while True:
+        ret, frame = cap2.read()
+        if not ret:
+            break
+
+        overlay = frame.copy()
+
+        # --- Gambar zona (poligon) sebagai layer transparan ---
+        for zone, zs in zip(zones, req.zones):
+            color = zone_colors[zone.name]
+            pts = zone.polygon.astype(int).reshape((-1, 1, 2))
+            if zone.type == "danger":
+                cv2.fillPoly(overlay, [pts], color)
+            cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=2)
+        frame = cv2.addWeighted(overlay, 0.18, frame, 0.82, 0)
+
+        frame_boxes = all_frame_detections[frame_idx] if frame_idx < len(all_frame_detections) else []
+        for track_id, raw_class_name, box in frame_boxes:
+            class_name = zone_tracker._majority_class(track_id, raw_class_name)
+            if class_name == "person" and track_id in rider_track_ids:
+                continue  # pengendara/penumpang -- jangan dihitung sebagai "Orang"
+
+            x1, y1, x2, y2 = box
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+
+            # --- Jejak lintasan (trail) ---
+            trails[track_id].append((int(cx), int(cy)))
+            color = track_color(track_id)
+            pts = list(trails[track_id])
+            for i in range(1, len(pts)):
+                cv2.line(frame, pts[i - 1], pts[i], color, 2)
+
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+            cv2.putText(
+                frame, f"{class_name}#{track_id}", (int(x1), max(0, int(y1) - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1,
+            )
 
         # --- Overlay info lokasi & waktu (gaya OSD CCTV) ---
         timestamp = base_dt + timedelta(seconds=frame_idx / fps)
@@ -258,24 +318,24 @@ def _run_detection(req: ProcessRequest):
         (tw, _), _ = cv2.getTextSize(ts_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
         cv2.putText(frame, ts_text, (width - tw - 8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
 
-        # Simpan snapshot bukti untuk safety event baru pada frame ini
-        for ev in new_events:
+        # Simpan snapshot bukti untuk safety event yang terjadi pada frame ini
+        for ev in events_by_frame.get(frame_idx, []):
             snap_name = f"{req.job_id}_{ev['track_id']}_{_sanitize(ev['zone_name'])}_{frame_idx}.jpg"
             snap_path = os.path.join(snapshots_dir, snap_name)
             cv2.imwrite(snap_path, frame)
             ev["snapshot_path"] = f"results/snapshots/{snap_name}"
             del ev["frame_idx"]
-            safety_events_out.append(ev)
 
         writer.write(frame)
         frame_idx += 1
 
-        if progress_interval and frame_idx % progress_interval == 0:
-            pct = min(99, int(frame_idx / total_frames * 100))
+        if progress_interval_2 and frame_idx % progress_interval_2 == 0:
+            pct = 70 + min(29, int(frame_idx / total_frames_actual * 29))
             if pct != last_progress_sent:
                 _send_progress(req, pct)
                 last_progress_sent = pct
 
+    cap2.release()
     writer.release()
 
     _transcode_to_h264(output_path)
