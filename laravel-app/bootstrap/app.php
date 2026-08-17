@@ -11,6 +11,19 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware) {
+        // Aplikasi berjalan di belakang reverse proxy Traefik (Coolify) yang
+        // menangani TLS -- koneksi Traefik ke container ini sendiri berupa
+        // HTTP biasa di jaringan Docker internal. Tanpa trustProxies, Laravel
+        // tidak percaya header X-Forwarded-Proto dari Traefik, sehingga
+        // mengira semua request HTTP biasa -- akibatnya semua URL yang
+        // di-generate (form action, redirect, asset) memakai skema "http://"
+        // walau pengunjung sebenarnya mengakses lewat HTTPS. Ini yang
+        // menyebabkan peringatan "not secure" saat submit form dan koneksi
+        // reset (domain ini hanya dikonfigurasi untuk HTTPS di Traefik).
+        // Trust "*" aman di sini karena Traefik adalah satu-satunya proxy di
+        // depan container, semuanya di jaringan privat VPS yang sama.
+        $middleware->trustProxies(at: '*');
+
         // Endpoint callback dari Python detector service dikecualikan dari CSRF
         // karena dipanggil server-to-server, bukan dari form browser.
         $middleware->validateCsrfTokens(except: [
