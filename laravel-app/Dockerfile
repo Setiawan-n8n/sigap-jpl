@@ -1,9 +1,9 @@
 FROM composer:2 AS vendor
 WORKDIR /app
 COPY composer.json composer.lock* ./
-RUN composer install --no-dev --no-scripts --no-autoloader --ignore-platform-reqs
+RUN composer config policy.advisories.block false && composer install --no-dev --no-scripts --no-autoloader --ignore-platform-reqs
 
-FROM php:8.2-cli
+FROM php:8.4-cli
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git unzip libsqlite3-dev libzip-dev libonig-dev \
@@ -15,10 +15,11 @@ WORKDIR /var/www/html
 COPY --from=vendor /app/vendor ./vendor
 COPY . .
 COPY docker/php.ini /usr/local/etc/php/conf.d/99-sigap-jpl.ini
+COPY --from=vendor /usr/bin/composer /usr/bin/composer
 
 RUN composer dump-autoload --optimize --no-scripts \
     && mkdir -p storage/framework/cache storage/framework/sessions storage/framework/views \
-       storage/logs storage/app/videos/results/snapshots database \
+       storage/logs storage/app/videos/results/snapshots database bootstrap/cache \
     && touch database/database.sqlite \
     && chmod -R 775 storage bootstrap/cache database
 
