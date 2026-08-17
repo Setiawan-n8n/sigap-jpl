@@ -20,8 +20,6 @@ services:
       ADMIN_NAME: "${ADMIN_NAME:-Administrator}"
     depends_on:
       - detector
-    networks:
-      - vehicle-counter
 
   queue:
     build:
@@ -43,8 +41,6 @@ services:
     depends_on:
       - detector
       - app
-    networks:
-      - vehicle-counter
 
   detector:
     build:
@@ -58,12 +54,6 @@ services:
       CALLBACK_SECRET: "${DETECTOR_CALLBACK_SECRET:-change-me-secret}"
       MODEL_NAME: "${MODEL_NAME:-yolov8n.pt}"
       DANGER_DWELL_SECONDS: "${DANGER_DWELL_SECONDS:-5}"
-    networks:
-      - vehicle-counter
-
-networks:
-  vehicle-counter:
-    driver: bridge
 
 volumes:
   videos_data:
