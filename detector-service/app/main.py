@@ -1,5 +1,6 @@
 import os
 import re
+import subprocess
 import threading
 import traceback
 from collections import defaultdict, deque
@@ -219,7 +220,37 @@ def _run_detection(req: ProcessRequest):
 
     writer.release()
 
+    _transcode_to_h264(output_path)
+
     return zone_tracker.direction_rows(), f"results/{output_filename}", safety_events_out
+
+
+def _transcode_to_h264(path: str) -> None:
+    """Re-encode video ke H.264 (codec "mp4v" hasil cv2.VideoWriter bisa
+    ditulis, tapi TIDAK bisa diputar langsung di browser -- Chrome/Firefox/
+    Safari hanya mendukung H.264/VP9/AV1 pada tag <video>). ffmpeg sudah
+    ter-install di image ini (lihat Dockerfile), jadi transcode dilakukan di
+    tempat, menimpa file mp4v dengan versi H.264 yang bisa diputar di browser.
+    Kalau ffmpeg gagal/tidak ada, file mp4v asli tetap dibiarkan (annotated
+    video tetap tersimpan, hanya tidak bisa diputar langsung di browser).
+    """
+    tmp_path = f"{path}.h264.tmp.mp4"
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", path,
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                tmp_path,
+            ],
+            check=True,
+            timeout=600,
+        )
+        os.replace(tmp_path, path)
+    except Exception:
+        traceback.print_exc()
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 def _send_callback(req: ProcessRequest, payload: dict):
