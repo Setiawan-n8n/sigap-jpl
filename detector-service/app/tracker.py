@@ -36,12 +36,33 @@ class ZoneTracker:
     danger_dwell_seconds: float = 5.0
 
     direction_counted: set = field(default_factory=set)     # {(track_id, zone_name)}
-    direction_counts: dict = field(default_factory=dict)    # {(class_name, zone_name): count}
     danger_state: dict = field(default_factory=dict)        # {(track_id, zone_name): {...}}
     danger_flagged: set = field(default_factory=set)        # {(track_id, zone_name)}
+    track_class_votes: dict = field(default_factory=dict)   # {track_id: {class_name: jumlah_frame}}
 
     def _point_in_zone(self, zone: Zone, x: float, y: float) -> bool:
         return cv2.pointPolygonTest(zone.polygon, (float(x), float(y)), False) >= 0
+
+    def _majority_class(self, track_id, fallback: str) -> str:
+        """Kelas "final" sebuah track = kelas yang paling sering muncul di
+        seluruh kemunculannya (voting mayoritas), BUKAN kelas pada frame
+        pertama track itu terlihat.
+
+        Alasan: YOLO kadang salah-klasifikasi objek yang sama secara
+        tidak konsisten antar frame walau track ID-nya tetap sama (mis.
+        motor yang sesaat terdeteksi sebagai "car"/"person" sebelum benar
+        sebagai "motorcycle" beberapa frame kemudian, karena sudut kamera/
+        oklusi/model nano yang kurang presisi). Kalau keputusan kelas
+        diambil dari frame pertama saja (perilaku lama), track tsb bisa
+        "terkunci" ke kelas yang salah dan objeknya tidak pernah terhitung
+        di kategori yang benar sama sekali -- ini persis penyebab kasus
+        "Motor" hilang total dari hasil deteksi meski motor jelas terlihat
+        lewat di video.
+        """
+        votes = self.track_class_votes.get(track_id)
+        if not votes:
+            return fallback
+        return max(votes.items(), key=lambda kv: kv[1])[0]
 
     def update(self, frame_idx: int, detections: list) -> list:
         """detections: list of (track_id, class_name, cx, cy).
@@ -49,16 +70,22 @@ class ZoneTracker:
         present_danger_keys = set()
 
         for track_id, class_name, cx, cy in detections:
+            # Catat "suara" kelas track ini pada frame sekarang -- dipakai
+            # nanti oleh _majority_class() untuk menentukan kelas final.
+            votes = self.track_class_votes.setdefault(track_id, {})
+            votes[class_name] = votes.get(class_name, 0) + 1
+
             for zone in self.zones:
                 if not self._point_in_zone(zone, cx, cy):
                     continue
 
                 if zone.type == "direction":
-                    key = (track_id, zone.name)
-                    if key not in self.direction_counted:
-                        self.direction_counted.add(key)
-                        dkey = (class_name, zone.name)
-                        self.direction_counts[dkey] = self.direction_counts.get(dkey, 0) + 1
+                    # Cukup catat bahwa track ini pernah masuk zona ini.
+                    # Kelas finalnya baru diputuskan belakangan (lihat
+                    # direction_rows()) memakai voting mayoritas, supaya
+                    # tidak salah-hitung akibat flicker klasifikasi di
+                    # frame pertama masuk zona.
+                    self.direction_counted.add((track_id, zone.name))
 
                 elif zone.type == "danger":
                     key = (track_id, zone.name)
@@ -67,7 +94,6 @@ class ZoneTracker:
                         self.danger_state[key] = {
                             "start_frame": frame_idx,
                             "last_frame": frame_idx,
-                            "class_name": class_name,
                         }
                     else:
                         self.danger_state[key]["last_frame"] = frame_idx
@@ -81,7 +107,7 @@ class ZoneTracker:
                     new_events.append({
                         "track_id": key[0],
                         "zone_name": key[1],
-                        "class_name": state["class_name"],
+                        "class_name": self._majority_class(key[0], "unknown"),
                         "video_time_seconds": state["start_frame"] / self.fps,
                         "duration_seconds": duration,
                         "frame_idx": frame_idx,
@@ -98,9 +124,14 @@ class ZoneTracker:
         return new_events
 
     def direction_rows(self) -> list:
+        tally: dict = {}
+        for track_id, zone_name in self.direction_counted:
+            cls = self._majority_class(track_id, "unknown")
+            key = (cls, zone_name)
+            tally[key] = tally.get(key, 0) + 1
         return [
             {"class_name": cls, "zone_name": zone_name, "count": count}
-            for (cls, zone_name), count in self.direction_counts.items()
+            for (cls, zone_name), count in tally.items()
         ]
 
 
