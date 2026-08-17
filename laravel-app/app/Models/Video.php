@@ -20,6 +20,7 @@ class Video extends Model
         'height',
         'recorded_at',
         'status',
+        'progress',
         'annotated_path',
         'error_message',
         'processed_at',

@@ -56,6 +56,7 @@ class ProcessRequest(BaseModel):
     classes: List[str] = ["person", "bicycle", "car", "motorcycle", "bus", "truck"]
     danger_dwell_seconds: float = DEFAULT_DANGER_DWELL_SECONDS
     callback_url: str
+    progress_url: Optional[str] = None
     callback_secret: Optional[str] = None
 
 
@@ -118,7 +119,16 @@ def _run_detection(req: ProcessRequest):
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
+    # CAP_PROP_FRAME_COUNT bisa tidak akurat untuk beberapa codec/VFR, tapi
+    # cukup baik untuk estimasi progress kasar. Kalau tidak tersedia (<= 0),
+    # progress reporting berbasis persentase cukup dilewati saja.
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
+
+    # Kirim update progress kira-kira tiap 5% supaya tidak membanjiri Laravel
+    # dengan request tapi UI tetap terasa "hidup" selama proses berjalan.
+    progress_interval = max(1, total_frames // 20) if total_frames > 0 else 0
+    last_progress_sent = -1
 
     zones = []
     for z in req.zones:
@@ -218,6 +228,12 @@ def _run_detection(req: ProcessRequest):
         writer.write(frame)
         frame_idx += 1
 
+        if progress_interval and frame_idx % progress_interval == 0:
+            pct = min(99, int(frame_idx / total_frames * 100))
+            if pct != last_progress_sent:
+                _send_progress(req, pct)
+                last_progress_sent = pct
+
     writer.release()
 
     _transcode_to_h264(output_path)
@@ -259,3 +275,15 @@ def _send_callback(req: ProcessRequest, payload: dict):
         requests.post(req.callback_url, json=payload, headers=headers, timeout=15)
     except requests.RequestException:
         traceback.print_exc()
+
+
+def _send_progress(req: ProcessRequest, pct: int):
+    if not req.progress_url:
+        return
+    headers = {"X-Callback-Secret": req.callback_secret or CALLBACK_SECRET}
+    try:
+        requests.post(req.progress_url, json={"progress": pct}, headers=headers, timeout=5)
+    except requests.RequestException:
+        # Progress cuma kosmetik -- kalau gagal terkirim, biarkan saja, jangan
+        # sampai mengganggu/menghentikan proses deteksi video yang sebenarnya.
+        pass

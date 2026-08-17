@@ -72,9 +72,35 @@ class VideoCallbackController extends Controller
 
         $video->update([
             'status' => 'completed',
+            'progress' => 100,
             'annotated_path' => $validated['annotated_path'] ?? null,
             'processed_at' => now(),
         ]);
+
+        return response()->json(['ok' => true]);
+    }
+
+    /**
+     * Update progress berkala dari detector-service selama video masih diproses
+     * (dipanggil beberapa kali per video, bukan cuma sekali di akhir seperti store()).
+     */
+    public function progress(Request $request, Video $video)
+    {
+        if (! hash_equals((string) config('services.detector.secret'), (string) $request->header('X-Callback-Secret'))) {
+            abort(403, 'Invalid callback secret.');
+        }
+
+        $validated = $request->validate([
+            'progress' => ['required', 'integer', 'min:0', 'max:100'],
+        ]);
+
+        // Jangan timpa status kalau video sudah completed/failed (mis. update
+        // progress yang telat sampai setelah callback selesai terkirim).
+        if (in_array($video->status, ['completed', 'failed'], true)) {
+            return response()->json(['ok' => true]);
+        }
+
+        $video->update(['progress' => $validated['progress']]);
 
         return response()->json(['ok' => true]);
     }

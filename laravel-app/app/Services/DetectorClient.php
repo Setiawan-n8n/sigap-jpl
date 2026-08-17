@@ -42,6 +42,7 @@ class DetectorClient
             'classes' => ['person', 'bicycle', 'car', 'motorcycle', 'bus', 'truck'],
             'danger_dwell_seconds' => (float) config('services.detector.danger_dwell_seconds', 5),
             'callback_url' => URL::to("/api/videos/{$video->id}/callback"),
+            'progress_url' => URL::to("/api/videos/{$video->id}/progress"),
             'callback_secret' => $this->callbackSecret,
         ]);
 

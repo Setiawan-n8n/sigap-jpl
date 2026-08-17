@@ -33,3 +33,6 @@ Route::middleware('auth')->group(function () {
 // sendiri (X-Callback-Secret), BUKAN sesi login, karena dipanggil server-to-server.
 Route::post('/api/videos/{video}/callback', [VideoCallbackController::class, 'store'])
     ->name('videos.callback');
+
+Route::post('/api/videos/{video}/progress', [VideoCallbackController::class, 'progress'])
+    ->name('videos.progress');

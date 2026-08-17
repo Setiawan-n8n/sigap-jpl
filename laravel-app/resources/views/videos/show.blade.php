@@ -13,8 +13,14 @@
         @if ($video->recorded_at) · {{ $video->recorded_at->format('d M Y H:i') }} @endif
     </p>
 
-    <div id="processing-msg" class="text-sm text-slate-500 mb-4 {{ in_array($video->status, ['completed', 'failed']) ? 'hidden' : '' }}">
-        Video sedang diproses oleh model deteksi (YOLOv8)... halaman ini akan diperbarui otomatis.
+    <div id="processing-msg" class="mb-4 {{ in_array($video->status, ['completed', 'failed']) ? 'hidden' : '' }}">
+        <p class="text-sm text-slate-500 mb-2">
+            Video sedang diproses oleh model deteksi (YOLOv8)... halaman ini akan diperbarui otomatis.
+        </p>
+        <div class="w-full bg-slate-200 rounded-full h-3 overflow-hidden">
+            <div id="progress-bar" class="bg-slate-900 h-3 rounded-full transition-all duration-500" style="width: {{ $video->progress }}%"></div>
+        </div>
+        <p class="text-xs text-slate-500 mt-1"><span id="progress-text">{{ $video->progress }}</span>%</p>
     </div>
 
     <div id="error-msg" class="text-sm text-red-600 mb-4 {{ $video->status === 'failed' ? '' : 'hidden' }}">
@@ -73,8 +79,15 @@ function render(data) {
         return;
     }
 
-    if (data.status !== 'completed') return;
+    if (data.status !== 'completed') {
+        const pct = data.progress || 0;
+        document.getElementById('progress-bar').style.width = pct + '%';
+        document.getElementById('progress-text').textContent = pct;
+        return;
+    }
 
+    document.getElementById('progress-bar').style.width = '100%';
+    document.getElementById('progress-text').textContent = 100;
     polling = false;
     document.getElementById('processing-msg').classList.add('hidden');
     document.getElementById('result-section').classList.remove('hidden');

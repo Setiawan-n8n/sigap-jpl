@@ -105,6 +105,7 @@ class VideoController extends Controller
 
         return response()->json([
             'status' => $video->status,
+            'progress' => $video->progress,
             'error_message' => $video->error_message,
             'zones' => $video->zones->map(fn ($z) => [
                 'name' => $z->name,
