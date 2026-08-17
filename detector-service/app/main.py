@@ -29,6 +29,8 @@ from .config import (
     CONF_THRESHOLD,
     DEFAULT_DANGER_DWELL_SECONDS,
     MODEL_NAME,
+    RIDER_HOST_CLASSES,
+    RIDER_OVERLAP_THRESHOLD,
     TARGET_CLASSES,
     TRAIL_LENGTH,
 )
@@ -102,6 +104,21 @@ def _sanitize(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower() or "zona"
 
 
+def _overlap_ratio(box_a, box_b) -> float:
+    """Rasio luas irisan terhadap luas box_a (0..1). Dipakai untuk menebak
+    apakah sebuah deteksi "person" kemungkinan besar pengendara/penumpang
+    kendaraan (box orang-nya tumpang tindih signifikan dengan box kendaraan),
+    bukan pejalan kaki lepas."""
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    area_a = max(1e-6, (ax2 - ax1) * (ay2 - ay1))
+    return inter / area_a
+
+
 def _parse_recorded_at(value: Optional[str]) -> datetime:
     if not value:
         return datetime.now()
@@ -151,6 +168,11 @@ def _run_detection(req: ProcessRequest):
     base_dt = _parse_recorded_at(req.recorded_at)
     trails: dict = defaultdict(lambda: deque(maxlen=TRAIL_LENGTH))
     safety_events_out = []
+    # Track ID "person" yang pernah terdeteksi tumpang tindih signifikan
+    # dengan kendaraan -- sekali ditandai sebagai pengendara/penumpang, tetap
+    # dikecualikan dari hitungan "Orang" seterusnya (supaya tidak
+    # berubah-ubah antar frame hanya karena sudut kamera/oklusi sesaat).
+    rider_track_ids: set = set()
 
     results = model.track(
         source=req.video_path,
@@ -183,14 +205,29 @@ def _run_detection(req: ProcessRequest):
             ids = boxes.id.cpu().numpy()
             cls_ids = boxes.cls.cpu().numpy()
 
+            frame_boxes = []  # (track_id, class_name, box)
             for box, tid, cls_id in zip(xyxy, ids, cls_ids):
                 class_name = TARGET_CLASSES.get(int(cls_id))
                 if class_name is None:
                     continue
+                frame_boxes.append((int(tid), class_name, box))
+
+            # Tandai "person" yang box-nya tumpang tindih signifikan dengan
+            # kendaraan sebagai pengendara/penumpang, bukan pejalan kaki.
+            vehicle_boxes = [b for _, cn, b in frame_boxes if cn in RIDER_HOST_CLASSES]
+            if vehicle_boxes:
+                for tid, cn, box in frame_boxes:
+                    if cn != "person" or tid in rider_track_ids:
+                        continue
+                    if any(_overlap_ratio(box, vbox) >= RIDER_OVERLAP_THRESHOLD for vbox in vehicle_boxes):
+                        rider_track_ids.add(tid)
+
+            for track_id, class_name, box in frame_boxes:
+                if class_name == "person" and track_id in rider_track_ids:
+                    continue  # pengendara/penumpang -- jangan dihitung sebagai "Orang"
 
                 x1, y1, x2, y2 = box
                 cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                track_id = int(tid)
                 detections.append((track_id, class_name, cx, cy))
 
                 # --- Jejak lintasan (trail) ---

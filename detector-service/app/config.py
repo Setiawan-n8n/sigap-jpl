@@ -16,3 +16,16 @@ TARGET_CLASSES = {
     5: "bus",
     7: "truck",
 }
+
+# Kelas kendaraan yang mungkin "ditumpangi" seseorang. Dipakai untuk
+# membedakan pejalan kaki asli dari pengendara/penumpang kendaraan supaya
+# angka "Orang" tidak dobel-hitung dengan "Motor"/"Mobil"/dst.
+RIDER_HOST_CLASSES = {"bicycle", "motorcycle", "car", "bus", "truck"}
+
+# Seberapa besar porsi bounding box "person" yang harus tertutup oleh
+# bounding box kendaraan (0..1) supaya orang tsb dianggap pengendara/
+# penumpang, bukan pejalan kaki. Makin kecil nilainya, makin agresif
+# mengecualikan orang di dekat kendaraan (risiko pejalan kaki yang lewat
+# tepat di samping motor ikut ter-exclude); makin besar, makin longgar
+# (risiko pengendara tetap kehitung sebagai pejalan kaki).
+RIDER_OVERLAP_THRESHOLD = float(os.getenv("RIDER_OVERLAP_THRESHOLD", "0.3"))
