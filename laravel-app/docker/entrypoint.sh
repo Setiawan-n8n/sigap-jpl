@@ -28,5 +28,13 @@ if [ "$1" = "queue" ]; then
     exec php artisan queue:work --tries=1 --timeout=1800
 else
     echo "Starting web server on :8000..."
-    exec php artisan serve --host=0.0.0.0 --port=8000
+    # PENTING: jangan pakai "php artisan serve". Perintah itu menjalankan PHP
+    # built-in server sebagai proses ANAK lewat Symfony Process, dan proses
+    # anak itu terbukti TIDAK mewarisi semua environment variable milik
+    # container (mis. APP_KEY hilang -> MissingAppKeyException) walau proses
+    # induknya sendiri punya env yang benar. Dengan exec langsung ke `php -S`
+    # memakai router.php yang sama yang dipakai artisan serve, proses PHP ini
+    # SENDIRI yang jadi PID 1 dan otomatis mewarisi seluruh environment
+    # container tanpa filtering.
+    exec php -S 0.0.0.0:8000 vendor/laravel/framework/src/Illuminate/Foundation/resources/server.php
 fi
