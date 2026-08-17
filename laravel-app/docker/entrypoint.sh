@@ -32,9 +32,12 @@ else
     # built-in server sebagai proses ANAK lewat Symfony Process, dan proses
     # anak itu terbukti TIDAK mewarisi semua environment variable milik
     # container (mis. APP_KEY hilang -> MissingAppKeyException) walau proses
-    # induknya sendiri punya env yang benar. Dengan exec langsung ke `php -S`
-    # memakai router.php yang sama yang dipakai artisan serve, proses PHP ini
-    # SENDIRI yang jadi PID 1 dan otomatis mewarisi seluruh environment
-    # container tanpa filtering.
-    exec php -S 0.0.0.0:8000 vendor/laravel/framework/src/Illuminate/Foundation/resources/server.php
+    # induknya sendiri punya env yang benar. Dengan exec langsung ke `php -S`,
+    # proses PHP ini SENDIRI yang jadi PID 1 dan otomatis mewarisi seluruh
+    # environment container tanpa filtering.
+    #
+    # Router kustom (public/router.php) dipakai, bukan server.php bawaan
+    # Laravel di vendor/, karena server.php bawaan salah menghitung path saat
+    # dijalankan di luar artisan serve.
+    exec php -S 0.0.0.0:8000 -t public public/router.php
 fi
