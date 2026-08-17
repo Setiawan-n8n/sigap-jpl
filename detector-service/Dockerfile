@@ -10,7 +10,7 @@ COPY requirements.txt .
 # Install CPU-only PyTorch dulu (VPS ini tidak punya GPU). Tanpa ini, pip akan
 # menarik build CUDA yang jauh lebih besar (ratusan MB paket nvidia-*) yang
 # sama sekali tidak terpakai dan bikin build lambat/rawan gagal.
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu \
+RUN pip install --no-cache-dir torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app

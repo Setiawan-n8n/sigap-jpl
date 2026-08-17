@@ -8,8 +8,19 @@ from typing import List, Optional
 
 import cv2
 import requests
+import torch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+
+# PyTorch >= 2.6 mengubah default torch.load menjadi weights_only=True, yang
+# bisa membuat ultralytics gagal memuat checkpoint YOLO (.pt berisi objek
+# Python yang di-pickle, bukan cuma tensor) dan meng-crash service ini saat
+# startup. Patch ini menyamakan perilaku dengan yang sudah dipakai di
+# Dockerfile saat build (lihat RUN unduh bobot model), tapi diterapkan juga
+# di runtime supaya konsisten di semua versi torch yang ter-install.
+_orig_torch_load = torch.load
+torch.load = lambda *a, **k: _orig_torch_load(*a, **{**k, "weights_only": False})
+
 from ultralytics import YOLO
 
 from .config import (
