@@ -8,9 +8,17 @@
     </div>
 
     <div id="processing-msg-{{ $video->id }}" class="mb-4 {{ in_array($video->status, ['completed', 'failed']) ? 'hidden' : '' }}">
-        <p class="text-sm text-slate-500 mb-2">
-            Video sedang diproses oleh model deteksi (YOLOv8)... panel ini akan diperbarui otomatis.
-        </p>
+        @if (isset($liveFinishAt) && $liveFinishAt)
+            <p class="text-sm text-slate-500 mb-2">
+                Rekaman &amp; deteksi live sedang berjalan sampai <strong>{{ $liveFinishAt->format('d M Y H:i') }}</strong>.
+                Video hasil deteksi baru bisa diputar setelah sesi ini selesai (sama seperti unggah video biasa,
+                bukan siaran langsung) -- panel ini akan berpindah otomatis begitu selesai.
+            </p>
+        @else
+            <p class="text-sm text-slate-500 mb-2">
+                Video sedang diproses oleh model deteksi (YOLOv8)... panel ini akan diperbarui otomatis.
+            </p>
+        @endif
         <div class="w-full bg-slate-200 rounded-full h-3 overflow-hidden">
             <div id="progress-bar-{{ $video->id }}" class="bg-slate-900 h-3 rounded-full transition-all duration-500" style="width: {{ $video->progress }}%"></div>
         </div>
@@ -158,7 +166,7 @@
                 ${ev.snapshot_url ? `<img src="${ev.snapshot_url}" class="w-24 h-16 object-cover rounded border" alt="snapshot">` : ''}
                 <div class="text-sm flex-1">
                     <div class="font-medium text-red-800">${labelMap[ev.class_name] || ev.class_name} di "${ev.zone_name}"</div>
-                    <div class="text-red-600 text-xs">Mulai menit ke-${formatDuration(ev.video_time_seconds)} · diam selama ${formatDuration(ev.duration_seconds)}</div>
+                    <div class="text-red-600 text-xs">Mulai menit ke-${formatDuration(ev.video_time_seconds)} - diam selama ${formatDuration(ev.duration_seconds)}</div>
                 </div>
             `;
             container.appendChild(card);
