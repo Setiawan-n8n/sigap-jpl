@@ -19,8 +19,8 @@
         </p>
     </div>
 @else
-    <div class="grid gap-8 lg:grid-cols-2">
-        <div class="bg-white rounded-xl shadow p-6">
+    <div class="grid gap-8 lg:grid-cols-3">
+        <div class="bg-white rounded-xl shadow p-6 lg:col-span-1">
             <h2 class="text-lg font-semibold mb-4">Lokasi Online ({{ $locations->count() }})</h2>
             <div class="space-y-3">
                 @foreach ($locations as $location)
@@ -38,7 +38,7 @@
             </div>
         </div>
 
-        <div class="bg-white rounded-xl shadow p-6">
+        <div class="bg-white rounded-xl shadow p-6 lg:col-span-1">
             <h2 class="text-lg font-semibold mb-4">Tayangan CCTV</h2>
             @if (! $selected)
                 <p class="text-sm text-slate-500">Pilih salah satu lokasi di sebelah kiri untuk menampilkan tayangan CCTV.</p>
@@ -65,6 +65,40 @@
                     Catatan: mendukung tautan streaming HLS/MP4 langsung atau tautan embed (iframe). Stream RTSP mentah
                     perlu di-relay ke HLS/MP4 terlebih dahulu agar dapat diputar di browser.
                 </p>
+            @endif
+        </div>
+
+        <div class="lg:col-span-1">
+            @if (! $selected)
+                <div class="bg-white rounded-xl shadow p-6 h-full">
+                    <h2 class="text-lg font-semibold mb-1">Video Hasil Deteksi &amp; Tracking</h2>
+                    <p class="text-sm text-slate-500">Pilih salah satu lokasi di sebelah kiri untuk menampilkan hasil deteksi live.</p>
+                </div>
+            @elseif ($liveVideo)
+                @include('videos._result_panel', ['video' => $liveVideo])
+            @elseif ($liveJob && $liveJob->status === 'scheduled')
+                <div class="bg-white rounded-xl shadow p-6 h-full">
+                    <h2 class="text-lg font-semibold mb-1">Video Hasil Deteksi &amp; Tracking</h2>
+                    <p class="text-sm text-slate-500 mb-3">Deteksi live untuk lokasi ini sudah dijadwalkan, belum dimulai.</p>
+                    <div class="rounded-lg border p-3 text-sm">
+                        <div class="font-medium mb-1">Terjadwal</div>
+                        <div class="text-slate-500 text-xs">
+                            {{ $liveJob->start_at->format('d M Y H:i') }} — {{ $liveJob->finish_at->format('d M Y H:i') }}
+                        </div>
+                    </div>
+                </div>
+            @else
+                <div class="bg-white rounded-xl shadow p-6 h-full">
+                    <h2 class="text-lg font-semibold mb-1">Video Hasil Deteksi &amp; Tracking</h2>
+                    <p class="text-sm text-slate-500">
+                        Belum ada jadwal deteksi live untuk lokasi ini.
+                        @if (auth()->user()->isAdmin())
+                            Buka menu <a href="{{ route('locations.index') }}" class="underline">Lokasi JPL</a> untuk menjadwalkannya.
+                        @else
+                            Hubungi Administrator untuk menjadwalkannya.
+                        @endif
+                    </p>
+                </div>
             @endif
         </div>
     </div>

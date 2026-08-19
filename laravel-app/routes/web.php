@@ -3,6 +3,7 @@
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\JplLocationController;
+use App\Http\Controllers\LiveCaptureJobController;
 use App\Http\Controllers\UserController;
 use App\Http\Controllers\VideoCallbackController;
 use App\Http\Controllers\VideoController;
@@ -26,6 +27,15 @@ Route::middleware(['auth', 'admin'])->group(function () {
     Route::post('/locations', [JplLocationController::class, 'store'])->name('locations.store');
     Route::post('/locations/{location}/cctv', [JplLocationController::class, 'updateCctv'])->name('locations.cctv');
     Route::delete('/locations/{location}', [JplLocationController::class, 'destroy'])->name('locations.destroy');
+
+    // Penjadwalan deteksi live CCTV (proses langsung tanpa merekam ke file
+    // dulu) -- lihat App\Http\Controllers\LiveCaptureJobController.
+    Route::post('/locations/{location}/live-jobs/snapshot', [LiveCaptureJobController::class, 'snapshot'])->name('locations.live-jobs.snapshot');
+    Route::post('/locations/{location}/live-jobs', [LiveCaptureJobController::class, 'store'])->name('locations.live-jobs.store');
+    Route::delete('/live-jobs/{liveCaptureJob}', [LiveCaptureJobController::class, 'cancel'])->name('live-jobs.cancel');
+    Route::get('/live-snapshots/{filename}', [LiveCaptureJobController::class, 'showSnapshot'])
+        ->name('locations.live-jobs.snapshot-image')
+        ->where('filename', '[A-Za-z0-9_\-\.]+');
 
     Route::get('/users', [UserController::class, 'index'])->name('users.index');
     Route::post('/users', [UserController::class, 'store'])->name('users.store');

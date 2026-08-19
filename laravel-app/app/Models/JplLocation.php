@@ -25,6 +25,11 @@ class JplLocation extends Model
         return $this->hasMany(Video::class);
     }
 
+    public function liveCaptureJobs(): HasMany
+    {
+        return $this->hasMany(LiveCaptureJob::class);
+    }
+
     /**
      * Lokasi ini muncul di Dashboard Online begitu Administrator mengisi URL CCTV.
      */

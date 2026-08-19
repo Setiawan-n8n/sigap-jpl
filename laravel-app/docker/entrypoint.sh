@@ -24,6 +24,16 @@ php artisan migrate --force
 php artisan sigap:ensure-admin
 
 if [ "$1" = "queue" ]; then
+    # schedule:work menjalankan Laravel Task Scheduling (routes/console.php)
+    # secara terus-menerus, mengecek tiap menit apakah ada jadwal deteksi
+    # live CCTV yang perlu dimulai (lihat sigap:start-due-live-jobs). Tidak
+    # ada proses cron terpisah di image ini, jadi dijalankan berdampingan
+    # dengan queue worker di container yang sama -- di-background-kan
+    # ('&') supaya queue:work tetap bisa jadi proses utama (exec/PID 1)
+    # yang menerima sinyal berhenti dari Docker seperti biasa.
+    echo "Starting scheduler..."
+    php artisan schedule:work &
+
     echo "Starting queue worker..."
     exec php artisan queue:work --tries=1 --timeout=1800
 else
