@@ -86,7 +86,35 @@
                             {{ $liveJob->start_at->format('d M Y H:i') }} — {{ $liveJob->finish_at->format('d M Y H:i') }}
                         </div>
                     </div>
+                    <p class="text-xs text-slate-400 mt-3">
+                        Halaman ini akan otomatis diperbarui saat waktu mulai tiba
+                        (<span id="live-job-refresh-note">menunggu...</span>) -- tidak perlu refresh manual.
+                    </p>
                 </div>
+                <script>
+                    (function () {
+                        const startAt = new Date("{{ $liveJob->start_at->toIso8601String() }}").getTime();
+                        const noteEl = document.getElementById('live-job-refresh-note');
+
+                        function scheduleNext() {
+                            const msUntilStart = startAt - Date.now();
+                            const delay = msUntilStart > 5 * 60000 ? 30000
+                                        : msUntilStart > 60000 ? 15000
+                                        : 5000;
+
+                            if (noteEl) {
+                                const secsLeft = Math.max(0, Math.round(msUntilStart / 1000));
+                                noteEl.textContent = secsLeft > 0
+                                    ? `cek lagi dalam ${Math.round(delay / 1000)} detik, ~${secsLeft} detik lagi`
+                                    : 'memulai...';
+                            }
+
+                            setTimeout(() => location.reload(), delay);
+                        }
+
+                        scheduleNext();
+                    })();
+                </script>
             @else
                 <div class="bg-white rounded-xl shadow p-6 h-full">
                     <h2 class="text-lg font-semibold mb-1">Video Hasil Deteksi &amp; Tracking</h2>
