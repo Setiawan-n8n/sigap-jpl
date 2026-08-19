@@ -2,7 +2,9 @@ import os
 import re
 import subprocess
 import threading
+import time
 import traceback
+import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -62,6 +64,24 @@ class ProcessRequest(BaseModel):
     callback_secret: Optional[str] = None
 
 
+class SnapshotRequest(BaseModel):
+    url: str
+
+
+class ProcessLiveRequest(BaseModel):
+    job_id: int
+    stream_url: str
+    location_name: str = "JPL"
+    start_at: Optional[str] = None
+    finish_at: str
+    zones: List[ZoneSchema]
+    classes: List[str] = ["person", "bicycle", "car", "motorcycle", "bus", "truck"]
+    danger_dwell_seconds: float = DEFAULT_DANGER_DWELL_SECONDS
+    callback_url: str
+    progress_url: Optional[str] = None
+    callback_secret: Optional[str] = None
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "model": MODEL_NAME}
@@ -83,9 +103,93 @@ def process(req: ProcessRequest):
     return {"accepted": True, "job_id": req.job_id}
 
 
+@app.post("/snapshot")
+def snapshot(req: SnapshotRequest):
+    """Ambil satu frame dari stream CCTV (dipanggil admin saat menjadwalkan
+    deteksi live, supaya admin bisa menggambar ulang zona di atas kondisi
+    kamera terkini -- lihat _capture_snapshot)."""
+    try:
+        rel_path, width, height = _capture_snapshot(req.url)
+    except Exception as exc:  # noqa: BLE001
+        traceback.print_exc()
+        raise HTTPException(status_code=422, detail=f"Gagal mengambil snapshot: {exc}")
+
+    return {"path": rel_path, "width": width, "height": height}
+
+
+@app.post("/process-live")
+def process_live(req: ProcessLiveRequest):
+    """Proses stream CCTV secara LANGSUNG (real-time) lewat YOLOv8 + ByteTrack,
+    tanpa merekam ke file terlebih dahulu -- lihat _run_live_detection."""
+    if not req.zones:
+        raise HTTPException(status_code=422, detail="Minimal satu zona diperlukan.")
+
+    try:
+        finish_at = datetime.fromisoformat(req.finish_at)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Format finish_at tidak valid.")
+
+    if finish_at <= datetime.now():
+        raise HTTPException(status_code=422, detail="finish_at sudah lewat.")
+
+    thread = threading.Thread(target=_process_live_video, args=(req, finish_at), daemon=True)
+    thread.start()
+
+    return {"accepted": True, "job_id": req.job_id}
+
+
+def _capture_snapshot(url: str):
+    """Ambil satu frame dari URL stream (HLS/MP4/RTSP) memakai ffmpeg dan
+    simpan sebagai JPEG di volume bersama /data/videos/live-snapshots, supaya
+    bisa dibaca balik oleh container Laravel (storage/app/videos) lewat
+    volume Docker yang sama. Mengembalikan (path_relatif, width, height)."""
+    snapshots_dir = "/data/videos/live-snapshots"
+    os.makedirs(snapshots_dir, exist_ok=True)
+
+    filename = f"{uuid.uuid4().hex}.jpg"
+    out_path = os.path.join(snapshots_dir, filename)
+
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-rtsp_transport", "tcp",
+            "-i", url,
+            "-frames:v", "1", "-q:v", "2",
+            out_path,
+        ],
+        check=True,
+        timeout=25,
+    )
+
+    frame = cv2.imread(out_path)
+    if frame is None:
+        raise RuntimeError("File snapshot tidak terbaca (stream mungkin tidak valid).")
+
+    height, width = frame.shape[:2]
+
+    return f"live-snapshots/{filename}", width, height
+
+
 def _process_video(req: ProcessRequest):
     try:
         counts, annotated_relpath, safety_events = _run_detection(req)
+        _send_callback(req, {
+            "status": "completed",
+            "annotated_path": annotated_relpath,
+            "counts": counts,
+            "safety_events": safety_events,
+        })
+    except Exception as exc:  # noqa: BLE001
+        traceback.print_exc()
+        _send_callback(req, {
+            "status": "failed",
+            "error_message": str(exc),
+        })
+
+
+def _process_live_video(req: ProcessLiveRequest, finish_at: datetime):
+    try:
+        counts, annotated_relpath, safety_events = _run_live_detection(req, finish_at)
         _send_callback(req, {
             "status": "completed",
             "annotated_path": annotated_relpath,
@@ -341,6 +445,193 @@ def _run_detection(req: ProcessRequest):
     _transcode_to_h264(output_path)
 
     return zone_tracker.direction_rows(), f"results/{output_filename}", safety_events_out
+
+
+def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
+    """Proses stream CCTV LANGSUNG lewat YOLOv8 + ByteTrack selama rentang
+    waktu terjadwal, tanpa merekam ke file dulu (beda dengan _run_detection
+    yang bekerja dua tahap atas file lokal yang bisa dibaca ulang).
+
+    Karena sumbernya stream live yang TIDAK bisa dibaca ulang/di-seek, di
+    sini deteksi & penggambaran dilakukan dalam SATU pass: setiap frame
+    langsung digambar begitu diproses, memakai kelas "mayoritas sejauh ini"
+    untuk track tsb (ZoneTracker._majority_class, sama seperti mode
+    unggah file, hanya saja votingnya baru final di akhir stream, bukan di
+    akhir seluruh video sejak awal). Konsekuensinya: label sebuah track di
+    detik-detik awal kemunculannya bisa saja masih berubah sesaat sebelum
+    stabil -- ini trade-off yang tidak terhindarkan untuk pemrosesan
+    real-time (tidak seperti file, di sini "masa depan" video belum ada saat
+    frame sekarang digambar).
+    """
+    base_dir = os.path.join("/data/videos", "live", str(req.job_id))
+    results_dir = os.path.join(base_dir, "results")
+    snapshots_dir = os.path.join(results_dir, "snapshots")
+    os.makedirs(snapshots_dir, exist_ok=True)
+
+    output_filename = f"{req.job_id}_annotated.mp4"
+    output_path = os.path.join(results_dir, output_filename)
+
+    base_dt = _parse_recorded_at(req.start_at)
+    wanted_ids = [cid for cid, name in TARGET_CLASSES.items() if name in req.classes]
+
+    cap = cv2.VideoCapture(req.stream_url)
+    if not cap.isOpened():
+        raise RuntimeError("Tidak dapat membuka stream CCTV. Periksa kembali URL-nya.")
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps <= 1 or fps > 60:
+        # Banyak stream live (HLS/RTSP relay) tidak melaporkan FPS yang
+        # benar lewat CAP_PROP_FPS -- pakai asumsi wajar untuk CCTV supaya
+        # durasi hasil rekaman anotasi tidak melenceng jauh.
+        fps = 15.0
+
+    zones = []
+    for z in req.zones:
+        zones.append(Zone(name=z.name, type=z.type, polygon=build_polygon(z.points, width, height)))
+    zone_colors = {z.name: hex_to_bgr(zs.color) for z, zs in zip(zones, req.zones)}
+
+    zone_tracker = ZoneTracker(zones=zones, fps=fps, danger_dwell_seconds=req.danger_dwell_seconds)
+
+    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+
+    trails: dict = defaultdict(lambda: deque(maxlen=TRAIL_LENGTH))
+    rider_track_ids: set = set()
+    safety_events_out = []
+
+    started_at = datetime.now()
+    planned_seconds = max(1.0, (finish_at - started_at).total_seconds())
+    last_progress_sent = -1
+    frame_idx = 0
+    consecutive_failures = 0
+    max_consecutive_failures = int(fps * 20)  # ~20 detik tanpa frame -> anggap stream putus
+
+    try:
+        while True:
+            now = datetime.now()
+            if now >= finish_at:
+                break
+
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    break
+                # Beri jeda singkat lalu coba lagi -- stream live kadang
+                # sesaat tersendat (buffering jaringan), bukan berarti putus.
+                time.sleep(0.2)
+                continue
+            consecutive_failures = 0
+
+            # Deteksi & tracking satu frame. persist=True menjaga ID track
+            # tetap konsisten antar pemanggilan berturut-turut (sama seperti
+            # stream=True pada mode unggah file, tapi di sini dipanggil
+            # manual per-frame karena sumbernya bukan path file).
+            results = model.track(
+                source=frame,
+                classes=wanted_ids,
+                conf=CONF_THRESHOLD,
+                tracker="bytetrack.yaml",
+                persist=True,
+                verbose=False,
+            )
+            result = results[0]
+
+            frame_boxes = []
+            boxes = result.boxes
+            if boxes is not None and boxes.id is not None:
+                xyxy = boxes.xyxy.cpu().numpy()
+                ids = boxes.id.cpu().numpy()
+                cls_ids = boxes.cls.cpu().numpy()
+
+                for box, tid, cls_id in zip(xyxy, ids, cls_ids):
+                    class_name = TARGET_CLASSES.get(int(cls_id))
+                    if class_name is None:
+                        continue
+                    frame_boxes.append((int(tid), class_name, box))
+
+                vehicle_boxes = [b for _, cn, b in frame_boxes if cn in RIDER_HOST_CLASSES]
+                if vehicle_boxes:
+                    for tid, cn, box in frame_boxes:
+                        if cn != "person" or tid in rider_track_ids:
+                            continue
+                        if any(_is_riding(box, vbox) for vbox in vehicle_boxes):
+                            rider_track_ids.add(tid)
+
+                zone_dets = []
+                for track_id, class_name, box in frame_boxes:
+                    x1, y1, x2, y2 = box
+                    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                    zone_dets.append((track_id, class_name, cx, cy))
+                new_events = zone_tracker.update(frame_idx, zone_dets)
+                for ev in new_events:
+                    safety_events_out.append(ev)
+
+            overlay = frame.copy()
+            for zone, zs in zip(zones, req.zones):
+                color = zone_colors[zone.name]
+                pts = zone.polygon.astype(int).reshape((-1, 1, 2))
+                if zone.type == "danger":
+                    cv2.fillPoly(overlay, [pts], color)
+                cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=2)
+            frame = cv2.addWeighted(overlay, 0.18, frame, 0.82, 0)
+
+            for track_id, raw_class_name, box in frame_boxes:
+                class_name = zone_tracker._majority_class(track_id, raw_class_name)
+                if class_name == "person" and track_id in rider_track_ids:
+                    continue
+
+                x1, y1, x2, y2 = box
+                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+
+                trails[track_id].append((int(cx), int(cy)))
+                color = track_color(track_id)
+                pts = list(trails[track_id])
+                for i in range(1, len(pts)):
+                    cv2.line(frame, pts[i - 1], pts[i], color, 2)
+
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                cv2.putText(
+                    frame, f"{class_name}#{track_id}", (int(x1), max(0, int(y1) - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1,
+                )
+
+            timestamp = base_dt + timedelta(seconds=(now - started_at).total_seconds())
+            cv2.rectangle(frame, (0, 0), (width, 28), (0, 0, 0), -1)
+            cv2.putText(frame, f"{req.location_name[:50]} (LIVE)", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+            ts_text = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            (tw, _), _ = cv2.getTextSize(ts_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            cv2.putText(frame, ts_text, (width - tw - 8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+
+            for ev in [e for e in safety_events_out if e.get("frame_idx") == frame_idx and "snapshot_path" not in e]:
+                ev["class_name"] = zone_tracker._majority_class(ev["track_id"], ev["class_name"])
+                snap_name = f"{req.job_id}_{ev['track_id']}_{_sanitize(ev['zone_name'])}_{frame_idx}.jpg"
+                snap_path = os.path.join(snapshots_dir, snap_name)
+                cv2.imwrite(snap_path, frame)
+                ev["snapshot_path"] = f"live/{req.job_id}/results/snapshots/{snap_name}"
+
+            writer.write(frame)
+            frame_idx += 1
+
+            elapsed = (now - started_at).total_seconds()
+            pct = min(99, int(elapsed / planned_seconds * 100))
+            if pct != last_progress_sent and pct % 2 == 0:
+                _send_progress(req, pct)
+                last_progress_sent = pct
+    finally:
+        cap.release()
+        writer.release()
+
+    if frame_idx == 0:
+        raise RuntimeError("Tidak ada frame yang berhasil dibaca dari stream CCTV selama sesi ini.")
+
+    for ev in safety_events_out:
+        ev.pop("frame_idx", None)
+
+    _transcode_to_h264(output_path)
+
+    return zone_tracker.direction_rows(), f"live/{req.job_id}/results/{output_filename}", safety_events_out
 
 
 def _transcode_to_h264(path: str) -> None:

@@ -10,14 +10,20 @@ class JplLocationController extends Controller
 {
     public function index()
     {
-        $locations = JplLocation::withCount('videos')->orderBy('name')->get()->map(function (JplLocation $location) {
-            $location->safety_event_count = SafetyEvent::whereIn(
-                'video_id',
-                $location->videos()->pluck('id')
-            )->count();
+        $locations = JplLocation::withCount('videos')
+            ->with(['liveCaptureJobs' => function ($query) {
+                $query->whereIn('status', ['scheduled', 'running'])->orderBy('start_at');
+            }])
+            ->orderBy('name')
+            ->get()
+            ->map(function (JplLocation $location) {
+                $location->safety_event_count = SafetyEvent::whereIn(
+                    'video_id',
+                    $location->videos()->pluck('id')
+                )->count();
 
-            return $location;
-        });
+                return $location;
+            });
 
         return view('locations.index', compact('locations'));
     }

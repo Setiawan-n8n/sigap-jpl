@@ -6,6 +6,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 
 class Video extends Model
 {
@@ -49,6 +50,20 @@ class Video extends Model
     public function safetyEvents(): HasMany
     {
         return $this->hasMany(SafetyEvent::class);
+    }
+
+    /**
+     * Relasi balik ke jadwal deteksi live yang menghasilkan video ini (null
+     * kalau video ini berasal dari unggahan manual, bukan CCTV terjadwal).
+     */
+    public function liveCaptureJob(): HasOne
+    {
+        return $this->hasOne(LiveCaptureJob::class);
+    }
+
+    public function isFromLiveCapture(): bool
+    {
+        return $this->liveCaptureJob !== null;
     }
 
     /**

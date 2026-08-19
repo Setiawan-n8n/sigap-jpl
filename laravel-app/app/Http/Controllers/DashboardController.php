@@ -56,14 +56,33 @@ class DashboardController extends Controller
         $totalLocations = JplLocation::count();
 
         $selected = null;
+        $liveJob = null;
+        $liveVideo = null;
+
         if ($request->filled('lokasi')) {
             $selected = $locations->firstWhere('id', $request->integer('lokasi'));
+        }
+
+        if ($selected) {
+            // Jadwal deteksi live paling relevan untuk lokasi ini: yang
+            // sedang berjalan/baru selesai diutamakan, kalau tidak ada
+            // tampilkan jadwal mendatang supaya admin/user tahu kapan akan
+            // ada hasil deteksi.
+            $liveJob = $selected->liveCaptureJobs()
+                ->whereIn('status', ['running', 'completed', 'failed'])
+                ->latest('start_at')
+                ->first()
+                ?? $selected->liveCaptureJobs()->where('status', 'scheduled')->orderBy('start_at')->first();
+
+            $liveVideo = $liveJob?->video;
         }
 
         return view('dashboard.online', [
             'locations' => $locations,
             'totalLocations' => $totalLocations,
             'selected' => $selected,
+            'liveJob' => $liveJob,
+            'liveVideo' => $liveVideo,
         ]);
     }
 

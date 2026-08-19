@@ -25,6 +25,14 @@ on-site dekat JPL, tanpa internet setelah image dibangun) maupun **online**
   event, filter berdasarkan lokasi & rentang tanggal, dan **export CSV**.
 - **Dashboard Online** — tayangan CCTV langsung per lokasi JPL, aktif begitu
   Administrator mengisi URL CCTV (HLS/MP4/embed) lewat menu Lokasi JPL.
+- **Deteksi live terjadwal** — Administrator bisa menjadwalkan rentang waktu
+  mulai/selesai (maks. 6 jam) untuk memproses stream CCTV sebuah lokasi
+  **secara langsung lewat YOLOv8**, tanpa merekam ke file dulu. Zona
+  digambar ulang di atas snapshot terkini yang diambil otomatis dari stream
+  saat penjadwalan dibuat. Hasilnya (video hasil deteksi & tracking, total per
+  kategori, rincian per zona, safety event) tampil di panel "Video Hasil
+  Deteksi & Tracking" pada Dashboard Online, di sebelah tayangan CCTV live.
+  Lihat bagian "Cara pakai" poin 9 di bawah.
 - **Login & role pengguna** — seluruh halaman (kecuali endpoint callback dari
   detector-service) dilindungi otentikasi. Dua role: **Administrator** (akses
   penuh: Unggah Video, Lokasi JPL, Kelola Pengguna) dan **User** (hanya bisa
@@ -141,6 +149,16 @@ admin terakhir tidak bisa dinonaktifkan/dihapus lewat menu Kelola Pengguna.
 8. Bagikan akun dengan role **user** (dibuat lewat menu Kelola Pengguna)
    kepada anggota tim yang hanya perlu memantau **Dashboard** — mereka tidak
    melihat menu Unggah Video/Lokasi JPL/Kelola Pengguna sama sekali.
+9. Untuk menjadwalkan **deteksi live**: di **/locations**, pada lokasi yang
+   sudah punya URL CCTV, klik **"+ Jadwalkan Deteksi Live"**. Isi waktu
+   mulai & selesai (di masa depan, maks. 6 jam), klik **"Ambil Snapshot dari
+   CCTV"** untuk mengambil gambar terkini dari stream, lalu gambar zona di
+   atasnya (sama seperti langkah 4) dan klik **Simpan Jadwal**. Saat waktu
+   mulai tiba, sistem otomatis memproses stream CCTV lokasi tersebut secara
+   langsung lewat YOLOv8 (tanpa merekam ke file dulu) sampai waktu selesai.
+   Hasilnya muncul di panel "Video Hasil Deteksi & Tracking" pada Dashboard
+   Online untuk lokasi tersebut, diperbarui otomatis seperti halaman detail
+   video biasa.
 
 ## Deploy ke VPS via Coolify
 
