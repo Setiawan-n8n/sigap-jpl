@@ -37,4 +37,36 @@ class JplLocationController extends Controller
 
         return redirect()->route('locations.index')->with('status', 'Lokasi JPL berhasil ditambahkan.');
     }
+
+    /**
+     * Mengisi/mengubah/menghapus URL CCTV lokasi -- ini yang mengaktifkan
+     * (atau menonaktifkan) Dashboard Online untuk lokasi tersebut.
+     */
+    public function updateCctv(Request $request, JplLocation $location)
+    {
+        $validated = $request->validate([
+            'cctv_url' => ['nullable', 'string', 'max:2048'],
+        ]);
+
+        $url = trim($validated['cctv_url'] ?? '');
+
+        $location->update([
+            'cctv_url' => $url !== '' ? $url : null,
+            'cctv_added_at' => $url !== '' ? now() : null,
+        ]);
+
+        return redirect()->route('locations.index')->with(
+            'status',
+            $url !== ''
+                ? 'URL CCTV disimpan. Dashboard Online kini aktif untuk lokasi ini.'
+                : 'URL CCTV dihapus. Dashboard Online untuk lokasi ini dinonaktifkan.'
+        );
+    }
+
+    public function destroy(JplLocation $location)
+    {
+        $location->delete();
+
+        return redirect()->route('locations.index')->with('status', 'Lokasi JPL dihapus.');
+    }
 }

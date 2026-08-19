@@ -10,7 +10,7 @@ class AuthController extends Controller
     public function showLogin()
     {
         if (Auth::check()) {
-            return redirect()->route('videos.index');
+            return redirect()->to($this->homeUrlFor(Auth::user()));
         }
 
         return view('auth.login');
@@ -33,9 +33,27 @@ class AuthController extends Controller
                 ->onlyInput('email');
         }
 
+        if (! Auth::user()->is_active) {
+            Auth::logout();
+
+            return back()
+                ->withErrors(['email' => 'Akun ini sudah dinonaktifkan. Hubungi Administrator.'])
+                ->onlyInput('email');
+        }
+
         $request->session()->regenerate();
 
-        return redirect()->intended(route('videos.index'));
+        return redirect()->intended($this->homeUrlFor(Auth::user()));
+    }
+
+    /**
+     * Halaman utama setelah login: Administrator ke halaman Unggah Video,
+     * user biasa ke Dashboard Online (mereka tidak punya menu Dashboard di
+     * navbar admin, jadi tidak boleh diarahkan ke rute khusus admin).
+     */
+    private function homeUrlFor($user): string
+    {
+        return $user->isAdmin() ? route('videos.index') : route('dashboard.online');
     }
 
     public function logout(Request $request)

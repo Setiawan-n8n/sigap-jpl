@@ -32,6 +32,8 @@ class EnsureAdminUser extends Command
             [
                 'name' => env('ADMIN_NAME', 'Administrator'),
                 'password' => $password,
+                'role' => 'admin',
+                'is_active' => true,
             ]
         );
 

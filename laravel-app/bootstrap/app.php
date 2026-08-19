@@ -29,6 +29,12 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->validateCsrfTokens(except: [
             'api/*',
         ]);
+
+        // Alias 'admin' -- membatasi rute khusus Administrator (Unggah Video,
+        // Lokasi JPL, Kelola Pengguna). Lihat App\Http\Middleware\EnsureUserIsAdmin.
+        $middleware->alias([
+            'admin' => \App\Http\Middleware\EnsureUserIsAdmin::class,
+        ]);
     })
     ->withExceptions(function (Exceptions $exceptions) {
         //

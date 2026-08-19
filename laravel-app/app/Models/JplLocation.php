@@ -12,11 +12,25 @@ class JplLocation extends Model
         'name',
         'km_position',
         'description',
+        'cctv_url',
+        'cctv_added_at',
+    ];
+
+    protected $casts = [
+        'cctv_added_at' => 'datetime',
     ];
 
     public function videos(): HasMany
     {
         return $this->hasMany(Video::class);
+    }
+
+    /**
+     * Lokasi ini muncul di Dashboard Online begitu Administrator mengisi URL CCTV.
+     */
+    public function hasOnlineCctv(): bool
+    {
+        return ! empty($this->cctv_url);
     }
 
     /**
