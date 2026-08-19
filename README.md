@@ -21,11 +21,15 @@ on-site dekat JPL, tanpa internet setelah image dibangun) maupun **online**
   serta overlay nama lokasi JPL + timestamp pada video hasil.
 - **Multi-lokasi JPL** — setiap video terhubung ke satu lokasi JPL terdaftar;
   dashboard menampilkan ringkasan & riwayat per lokasi.
-- **Dashboard & laporan historis** — ringkasan total video/objek/safety event,
-  filter berdasarkan lokasi & rentang tanggal, dan **export CSV**.
-- **Login** — seluruh halaman (kecuali endpoint callback dari detector-service)
-  dilindungi otentikasi; akun dibuat lewat environment variable, bukan
-  registrasi publik.
+- **Dashboard Offline & laporan historis** — ringkasan total video/objek/safety
+  event, filter berdasarkan lokasi & rentang tanggal, dan **export CSV**.
+- **Dashboard Online** — tayangan CCTV langsung per lokasi JPL, aktif begitu
+  Administrator mengisi URL CCTV (HLS/MP4/embed) lewat menu Lokasi JPL.
+- **Login & role pengguna** — seluruh halaman (kecuali endpoint callback dari
+  detector-service) dilindungi otentikasi. Dua role: **Administrator** (akses
+  penuh: Unggah Video, Lokasi JPL, Kelola Pengguna) dan **User** (hanya bisa
+  membuka menu Dashboard, baik Online maupun Offline). Lihat bagian
+  "Login, akun admin & manajemen pengguna" di bawah.
 - Kelas objek yang dideteksi: **person, bicycle, car, motorcycle, bus, truck**.
 
 ## Arsitektur
@@ -84,21 +88,34 @@ Setelah semua container jalan:
 - **http://localhost:8000/locations** — kelola daftar lokasi JPL.
 - Service detector bisa dicek langsung di **http://localhost:8001/health**.
 
-## Login & akun admin
+## Login, akun admin & manajemen pengguna
 
-Tidak ada halaman registrasi publik — akun dibuat/diperbarui otomatis setiap
-container `app`/`queue` start, berdasarkan environment variable:
+Tidak ada halaman registrasi publik. Satu akun Administrator awal
+dibuat/diperbarui otomatis setiap container `app`/`queue` start, berdasarkan
+environment variable:
 
 - `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `ADMIN_NAME` (opsional, default "Administrator").
 
 Kalau kedua variable itu tidak diset, tidak ada akun yang dibuat/diubah
-(command `sigap:ensure-admin` dilewati). Untuk mengganti password akun yang
-sudah ada, cukup ubah `ADMIN_PASSWORD` lalu restart/redeploy container — akun
-dengan email yang sama akan diperbarui passwordnya (bukan dibuat akun baru).
+(command `sigap:ensure-admin` dilewati). Untuk mengganti password akun ini,
+cukup ubah `ADMIN_PASSWORD` lalu restart/redeploy container — akun dengan
+email yang sama akan diperbarui passwordnya (bukan dibuat akun baru). Akun
+ini selalu diberi role `admin` dan status aktif oleh `sigap:ensure-admin`,
+jadi tidak akan pernah terkunci keluar meski di-nonaktifkan lewat menu
+Kelola Pengguna.
 
-Ingin lebih dari satu akun bernama per anggota tim (bukan satu akun admin
-bersama)? Ini bisa ditambahkan sebagai halaman manajemen user terpisah —
-tinggal minta kalau diperlukan.
+Untuk akun-akun lain (anggota tim yang hanya perlu memantau Dashboard, atau
+Administrator tambahan), login sebagai Administrator lalu buka menu
+**Kelola Pengguna** untuk menambah, menonaktifkan, reset password, atau
+menghapus akun. Ada dua role:
+
+- **admin** — akses penuh: Unggah Video, Lokasi JPL, Kelola Pengguna, plus
+  kedua Dashboard.
+- **user** — hanya menu Dashboard (Online & Offline); mencoba membuka URL
+  halaman admin secara langsung akan otomatis diarahkan balik ke Dashboard.
+
+Sistem selalu menjaga agar minimal ada satu akun Administrator aktif — akun
+admin terakhir tidak bisa dinonaktifkan/dihapus lewat menu Kelola Pengguna.
 
 ## Cara pakai
 
@@ -118,6 +135,12 @@ tinggal minta kalau diperlukan.
    - Video hasil deteksi (kotak pembatas + ID + jejak lintasan + zona + overlay lokasi/waktu).
    - Grafik & tabel rincian jumlah per kelas objek per zona.
    - Daftar **safety event** (objek yang diam di zona bahaya) lengkap foto bukti.
+7. (Opsional) Di **/locations**, isi kolom URL CCTV pada lokasi yang sudah
+   punya kamera live — lokasi itu langsung muncul di **Dashboard Online**
+   untuk semua pengguna.
+8. Bagikan akun dengan role **user** (dibuat lewat menu Kelola Pengguna)
+   kepada anggota tim yang hanya perlu memantau **Dashboard** — mereka tidak
+   melihat menu Unggah Video/Lokasi JPL/Kelola Pengguna sama sekali.
 
 ## Deploy ke VPS via Coolify
 

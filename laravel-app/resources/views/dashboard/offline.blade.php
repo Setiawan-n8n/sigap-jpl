@@ -1,8 +1,10 @@
 @extends('layouts.app')
 
-@section('title', 'SIGAP-JPL — Dashboard')
+@section('title', 'SIGAP-JPL — Dashboard Offline')
 
 @section('content')
+@include('dashboard._tabs')
+
 <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
     <div class="bg-white rounded-xl shadow p-4">
         <div class="text-xs text-slate-500">Total Video</div>

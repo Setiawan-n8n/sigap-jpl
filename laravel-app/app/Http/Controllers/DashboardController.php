@@ -42,7 +42,29 @@ class DashboardController extends Controller
             'total_objects' => (int) CountResult::sum('count'),
         ];
 
-        return view('dashboard.index', compact('videos', 'locations', 'summary'));
+        return view('dashboard.offline', compact('videos', 'locations', 'summary'));
+    }
+
+    /**
+     * Dashboard Online: daftar lokasi JPL yang sudah diisi URL CCTV oleh
+     * Administrator (lihat JplLocationController::updateCctv), plus tayangan
+     * CCTV untuk lokasi yang dipilih.
+     */
+    public function online(Request $request)
+    {
+        $locations = JplLocation::whereNotNull('cctv_url')->orderBy('name')->get();
+        $totalLocations = JplLocation::count();
+
+        $selected = null;
+        if ($request->filled('lokasi')) {
+            $selected = $locations->firstWhere('id', $request->integer('lokasi'));
+        }
+
+        return view('dashboard.online', [
+            'locations' => $locations,
+            'totalLocations' => $totalLocations,
+            'selected' => $selected,
+        ]);
     }
 
     public function export(Request $request)
