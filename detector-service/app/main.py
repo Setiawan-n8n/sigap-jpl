@@ -149,17 +149,34 @@ def _capture_snapshot(url: str):
     filename = f"{uuid.uuid4().hex}.jpg"
     out_path = os.path.join(snapshots_dir, filename)
 
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-rtsp_transport", "tcp",
-            "-i", url,
-            "-frames:v", "1", "-q:v", "2",
-            out_path,
-        ],
-        check=True,
-        timeout=25,
-    )
+    cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+
+    # "-rtsp_transport" adalah opsi khusus demuxer RTSP -- kalau dipaksakan
+    # ke URL HLS/HTTP (.m3u8/.mp4), ffmpeg gagal karena opsi itu tidak
+    # dikenali oleh demuxer yang dipakai. Hanya sertakan untuk URL rtsp://.
+    if url.lower().startswith(("rtsp://", "rtsps://")):
+        cmd += ["-rtsp_transport", "tcp"]
+    else:
+        # Banyak proxy CCTV instansi (mis. ATCS pemda) menolak request tanpa
+        # User-Agent yang terlihat seperti browser biasa (dianggap bot).
+        cmd += [
+            "-user_agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        ]
+
+    cmd += ["-i", url, "-frames:v", "1", "-q:v", "2", out_path]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+
+    if result.returncode != 0:
+        # Sertakan pesan error ASLI dari ffmpeg (bukan cuma kode exit) supaya
+        # penyebabnya (mis. 403 Forbidden, protokol tidak didukung, URL
+        # kedaluwarsa) langsung terlihat oleh admin di UI, bukan cuma
+        # "returned non-zero exit status".
+        stderr_tail = (result.stderr or "").strip().splitlines()
+        detail = " | ".join(stderr_tail[-3:]) if stderr_tail else f"exit code {result.returncode}"
+        raise RuntimeError(detail)
 
     frame = cv2.imread(out_path)
     if frame is None:
@@ -168,7 +185,6 @@ def _capture_snapshot(url: str):
     height, width = frame.shape[:2]
 
     return f"live-snapshots/{filename}", width, height
-
 
 def _process_video(req: ProcessRequest):
     try:
