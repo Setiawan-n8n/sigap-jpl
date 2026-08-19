@@ -86,6 +86,31 @@ class DashboardController extends Controller
         ]);
     }
 
+    /**
+     * Endpoint JSON ringan dipakai oleh dashboard.online untuk mengecek
+     * apakah status jadwal deteksi live sebuah lokasi sudah berubah (mis.
+     * dari "scheduled" ke "running"), TANPA me-reload seluruh halaman.
+     * Reload penuh (yang me-restart video Tayangan CCTV) hanya dilakukan
+     * sekali oleh JS di sisi klien, persis saat statusnya benar-benar
+     * berubah -- lihat resources/views/dashboard/online.blade.php.
+     */
+    public function onlineStatus(Request $request)
+    {
+        $location = JplLocation::whereNotNull('cctv_url')->find($request->integer('lokasi'));
+
+        if (! $location) {
+            return response()->json(['status' => 'none']);
+        }
+
+        $liveJob = $location->liveCaptureJobs()
+            ->whereIn('status', ['running', 'completed', 'failed'])
+            ->latest('start_at')
+            ->first()
+            ?? $location->liveCaptureJobs()->where('status', 'scheduled')->orderBy('start_at')->first();
+
+        return response()->json(['status' => $liveJob->status ?? 'none']);
+    }
+
     public function export(Request $request)
     {
         $query = Video::query()->with(['jplLocation', 'countResults', 'safetyEvents'])->latest();

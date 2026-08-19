@@ -56,6 +56,7 @@ Route::middleware('auth')->group(function () {
         return redirect()->route('dashboard.online');
     })->name('dashboard.index');
     Route::get('/dashboard/online', [DashboardController::class, 'online'])->name('dashboard.online');
+    Route::get('/dashboard/online/status', [DashboardController::class, 'onlineStatus'])->name('dashboard.online.status');
     Route::get('/dashboard/offline', [DashboardController::class, 'index'])->name('dashboard.offline');
     Route::get('/dashboard/export', [DashboardController::class, 'export'])->name('dashboard.export');
 });

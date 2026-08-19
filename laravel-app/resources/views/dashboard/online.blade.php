@@ -75,7 +75,7 @@
                     <p class="text-sm text-slate-500">Pilih salah satu lokasi di sebelah kiri untuk menampilkan hasil deteksi live.</p>
                 </div>
             @elseif ($liveVideo)
-                @include('videos._result_panel', ['video' => $liveVideo])
+                @include('videos._result_panel', ['video' => $liveVideo, 'liveFinishAt' => $liveJob->finish_at])
             @elseif ($liveJob && $liveJob->status === 'scheduled')
                 <div class="bg-white rounded-xl shadow p-6 h-full">
                     <h2 class="text-lg font-semibold mb-1">Video Hasil Deteksi &amp; Tracking</h2>
@@ -87,32 +87,41 @@
                         </div>
                     </div>
                     <p class="text-xs text-slate-400 mt-3">
-                        Halaman ini akan otomatis diperbarui saat waktu mulai tiba
-                        (<span id="live-job-refresh-note">menunggu...</span>) -- tidak perlu refresh manual.
+                        Halaman ini akan otomatis diperbarui saat waktu mulai tiba -- tidak perlu refresh manual.
                     </p>
                 </div>
                 <script>
                     (function () {
+                        // PENTING: jangan pakai location.reload() berkala di sini -- itu
+                        // ikut me-restart <video> Tayangan CCTV di kolom sebelah tiap kali
+                        // dipanggil (video-nya jadi terputus-putus / "hidup mati"). Sebagai
+                        // gantinya, cek status lewat endpoint JSON ringan di background
+                        // (tidak menyentuh DOM tayangan CCTV sama sekali), dan HANYA
+                        // reload sekali, persis saat statusnya benar-benar berubah.
+                        const statusUrl = "{{ route('dashboard.online.status') }}?lokasi={{ $selected->id }}";
+                        const initialStatus = "{{ $liveJob->status }}";
                         const startAt = new Date("{{ $liveJob->start_at->toIso8601String() }}").getTime();
-                        const noteEl = document.getElementById('live-job-refresh-note');
 
-                        function scheduleNext() {
-                            const msUntilStart = startAt - Date.now();
-                            const delay = msUntilStart > 5 * 60000 ? 30000
-                                        : msUntilStart > 60000 ? 15000
-                                        : 5000;
-
-                            if (noteEl) {
-                                const secsLeft = Math.max(0, Math.round(msUntilStart / 1000));
-                                noteEl.textContent = secsLeft > 0
-                                    ? `cek lagi dalam ${Math.round(delay / 1000)} detik, ~${secsLeft} detik lagi`
-                                    : 'memulai...';
+                        async function check() {
+                            try {
+                                const res = await fetch(statusUrl);
+                                const data = await res.json();
+                                if (data.status !== initialStatus) {
+                                    location.reload();
+                                    return;
+                                }
+                            } catch (e) {
+                                console.error(e);
                             }
 
-                            setTimeout(() => location.reload(), delay);
+                            const msUntilStart = startAt - Date.now();
+                            const delay = msUntilStart > 5 * 60000 ? 20000
+                                        : msUntilStart > 60000 ? 8000
+                                        : 3000;
+                            setTimeout(check, delay);
                         }
 
-                        scheduleNext();
+                        check();
                     })();
                 </script>
             @else
