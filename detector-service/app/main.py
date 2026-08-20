@@ -257,6 +257,35 @@ def _is_riding(person_box, vehicle_box) -> bool:
     return py2 >= vy1 and _py1 <= vy2
 
 
+def _purge_riders_from_tally(zone_tracker: ZoneTracker, rider_track_ids: set) -> None:
+    """Buang track pengendara/penumpang (rider_track_ids) dari hasil hitungan
+    zona (ZoneTracker.direction_counted), BUKAN cuma dari video anotasi.
+
+    PENTING -- ini bug terpisah dari yang sudah ada: kode sebelumnya HANYA
+    mengecualikan rider_track_ids saat MENGGAMBAR kotak/label di video
+    (lihat loop penggambaran di bawah, ada `if class_name == "person" and
+    track_id in rider_track_ids: continue`), tapi TIDAK pernah mengecualikan
+    track yang sama dari zone_dets yang dikirim ke ZoneTracker.update().
+    Akibatnya, orang yang menaiki motor/mobil tetap ikut ter-tally sebagai
+    "Orang" di ZoneTracker.direction_counted & muncul di tabel "Rincian per
+    Zona" / grafik "Total per Kategori" -- walau di video hasil deteksinya
+    sendiri kotaknya sudah tidak digambar (makanya bug ini tidak kelihatan
+    hanya dengan menonton videonya, harus dicek angka tabelnya).
+
+    Dipanggil sekali di akhir (setelah rider_track_ids final -- tidak akan
+    bertambah lagi), supaya track yang baru ketahuan sebagai
+    pengendara/penumpang belakangan (mis. motornya baru masuk frame
+    belakangan) tetap ikut terkoreksi, bukan cuma yang ketahuan sejak awal.
+    """
+    if not rider_track_ids:
+        return
+    zone_tracker.direction_counted = {
+        (track_id, zone_name)
+        for track_id, zone_name in zone_tracker.direction_counted
+        if track_id not in rider_track_ids
+    }
+
+
 def _parse_recorded_at(value: Optional[str]) -> datetime:
     if not value:
         return datetime.now()
@@ -384,6 +413,11 @@ def _run_detection(req: ProcessRequest):
                 last_progress_sent = pct
 
     total_frames_actual = len(all_frame_detections)
+
+    # rider_track_ids sudah final sekarang (seluruh video sudah dibaca) --
+    # koreksi hitungan zona supaya pengendara/penumpang tidak ikut ter-tally
+    # sebagai "Orang" (lihat docstring _purge_riders_from_tally).
+    _purge_riders_from_tally(zone_tracker, rider_track_ids)
 
     # Sekarang seluruh video sudah "dibaca suaranya" -- putuskan kelas final
     # tiap event bahaya (safety event) memakai voting mayoritas juga, bukan
@@ -659,6 +693,11 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
 
     if frame_idx == 0:
         raise RuntimeError("Tidak ada frame yang berhasil dibaca dari stream CCTV selama sesi ini.")
+
+    # rider_track_ids sudah final sekarang (sesi live sudah selesai) --
+    # koreksi hitungan zona supaya pengendara/penumpang tidak ikut ter-tally
+    # sebagai "Orang" (lihat docstring _purge_riders_from_tally).
+    _purge_riders_from_tally(zone_tracker, rider_track_ids)
 
     for ev in safety_events_out:
         ev.pop("frame_idx", None)
