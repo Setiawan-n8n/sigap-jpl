@@ -392,10 +392,24 @@ def _run_detection(req: ProcessRequest):
 
             # Catat "suara" kelas & posisi tiap track untuk keperluan
             # voting mayoritas & hitungan zona (lihat ZoneTracker.update).
+            #
+            # PENTING: titik yang diuji terhadap poligon zona sengaja pakai
+            # tengah-BAWAH kotak (bottom-center: cx = tengah horizontal,
+            # cy = y2/sisi bawah), BUKAN titik tengah geometris kotak
+            # (dulu (y1+y2)/2). Kamera CCTV di sini mengambil gambar dari
+            # sudut miring/tinggi (bukan tegak lurus dari atas), jadi posisi
+            # sebenarnya sebuah kendaraan di jalan diwakili oleh titik roda
+            # menyentuh aspal (dekat sisi bawah kotak) -- bukan titik tengah
+            # kotaknya. Untuk kendaraan tinggi (bus/truk) atau kotak yang
+            # memanjang ke atas (mis. mencakup kepala pengendara motor),
+            # titik tengah kotak bisa "kepeleset" masuk ke garis zona
+            # padahal posisi kendaraan yang sebenarnya (di jalan) masih di
+            # luar garis itu -- inilah penyebab kendaraan yang terlihat di
+            # luar area pantauan tetap ikut ter-tally.
             zone_dets = []
             for track_id, class_name, box in frame_boxes:
                 x1, y1, x2, y2 = box
-                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                cx, cy = (x1 + x2) / 2, y2
                 zone_dets.append((track_id, class_name, cx, cy))
             new_events = zone_tracker.update(frame_idx, zone_dets)
             safety_events_out.extend(new_events)
@@ -627,10 +641,13 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
                         if any(_is_riding(box, vbox) for vbox in vehicle_boxes):
                             rider_track_ids.add(tid)
 
+                # Sama seperti di _run_detection: pakai titik tengah-BAWAH
+                # kotak (bottom-center) untuk uji zona, bukan titik tengah
+                # geometris kotak -- lihat penjelasan lengkap di sana.
                 zone_dets = []
                 for track_id, class_name, box in frame_boxes:
                     x1, y1, x2, y2 = box
-                    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                    cx, cy = (x1 + x2) / 2, y2
                     zone_dets.append((track_id, class_name, cx, cy))
                 new_events = zone_tracker.update(frame_idx, zone_dets)
                 for ev in new_events:
