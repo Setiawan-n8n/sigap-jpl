@@ -585,12 +585,21 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if not fps or fps <= 1 or fps > 60:
-        # Banyak stream live (HLS/RTSP relay) tidak melaporkan FPS yang
-        # benar lewat CAP_PROP_FPS -- pakai asumsi wajar untuk CCTV supaya
-        # durasi hasil rekaman anotasi tidak melenceng jauh.
-        fps = 15.0
+    # PENTING: SENGAJA tidak lagi memakai cap.get(cv2.CAP_PROP_FPS) sama
+    # sekali untuk sesi live. Banyak stream live (HLS/RTSP relay, termasuk
+    # proxy ATCS) melaporkan angka FPS yang "valid" secara teknis (lolos
+    # pengecekan wajar) tapi jauh lebih rendah dari kenyataan (mis. 5-8
+    # fps) -- padahal angka inilah yang menentukan frame rate video hasil
+    # akhir (lihat pacing di bawah). Video yang dideklarasikan di frame
+    # rate serendah itu terlihat "patah-patah"/lambat ke mata manusia,
+    # BUKAN karena durasinya salah (itu sudah diperbaiki lewat pacing di
+    # bawah), tapi karena frame rate videonya sendiri terlalu rendah untuk
+    # terlihat mulus dibanding tayangan CCTV aslinya. Karena penulisan
+    # video sekarang sudah dipacing mengikuti waktu nyata (bukan lagi
+    # bergantung pada frame rate asli sumbernya untuk akurasi durasi),
+    # aman & lebih baik untuk selalu pakai angka frame rate output yang
+    # wajar & konsisten, terlepas dari apa pun yang dilaporkan stream-nya.
+    fps = 15.0
 
     zones = []
     for z in req.zones:
