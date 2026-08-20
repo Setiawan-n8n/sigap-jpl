@@ -614,6 +614,14 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
     planned_seconds = max(1.0, (finish_at - started_at).total_seconds())
     last_progress_sent = -1
     frame_idx = 0
+    # PENTING: penghitung frame yang SUDAH ditulis ke file video output --
+    # SENGAJA dipisah dari frame_idx (lihat pemakaiannya di titik penulisan
+    # `writer.write` di bawah). frame_idx menghitung berapa kali deteksi/
+    # YOLO berhasil dijalankan (dipakai ZoneTracker & penandaan safety
+    # event); output_frames_written menghitung berapa frame yang SUDAH
+    # benar-benar ditulis ke video, DIPAKSA mengikuti waktu NYATA yang
+    # berlalu supaya video akhir tidak "slow motion".
+    output_frames_written = 0
     consecutive_failures = 0
     # PENTING: sebelumnya, begitu pembacaan gagal terus-menerus selama
     # ~20 detik, kode langsung MENYERAH (break) dan melaporkan sesi sebagai
@@ -761,14 +769,44 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
                 cv2.imwrite(snap_path, frame)
                 ev["snapshot_path"] = f"live/{req.job_id}/results/snapshots/{snap_name}"
 
-            writer.write(frame)
+            # PENTING: sebelumnya, satu frame yang berhasil diproses = satu
+            # frame ditulis ke video, TANPA memperhitungkan berapa lama
+            # waktu NYATA yang benar-benar berlalu untuk memproses frame
+            # itu (mis. karena inferensi YOLO/jaringan naik-turun
+            # kecepatannya). Video akhir sempat "diperbaiki" durasinya
+            # dengan melabeli ulang SATU frame rate rata-rata untuk
+            # seluruh video (lihat riwayat perbaikan sebelumnya) -- itu
+            # membuat TOTAL durasi cocok, tapi gerakan di dalam videonya
+            # jadi terlihat "slow motion" (frame rate rata-rata itu
+            # dipaksakan rata ke seluruh video, padahal kecepatan
+            # pemrosesan nyata naik-turun sepanjang sesi). Perbaikan yang
+            # benar: TULIS frame mengikuti waktu NYATA yang berlalu, bukan
+            # sekadar sekali per frame yang berhasil diproses -- kalau
+            # pemrosesan frame ini memakan waktu lebih dari 1/fps detik,
+            # ulangi (duplikasi) frame yang sama untuk mengisi "jeda" itu
+            # sampai video mengejar waktu nyata, persis seperti cara kerja
+            # perekam CCTV biasa saat sesaat tersendat (menahan frame
+            # terakhir, bukan mempercepat/memperlambat seluruh rekaman).
+            now_after_processing = datetime.now(timezone.utc)
+            elapsed = (now_after_processing - started_at).total_seconds()
+            target_output_frames = int(elapsed * fps)
+            while output_frames_written < target_output_frames:
+                writer.write(frame)
+                output_frames_written += 1
             frame_idx += 1
 
-            elapsed = (now - started_at).total_seconds()
             pct = min(99, int(elapsed / planned_seconds * 100))
             if pct != last_progress_sent and pct % 2 == 0:
                 _send_progress(req, pct)
                 last_progress_sent = pct
+
+        if output_frames_written == 0 and frame_idx > 0:
+            # Jaga-jaga: kalau sesi sangat singkat sehingga belum sempat
+            # menulis satu frame pun ke output lewat pacing di atas, tetap
+            # tulis minimal frame terakhir yang berhasil diproses supaya
+            # file video tidak kosong/rusak.
+            writer.write(frame)
+            output_frames_written += 1
     finally:
         cap.release()
         writer.release()
@@ -797,23 +835,15 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
     for ev in safety_events_out:
         ev.pop("frame_idx", None)
 
-    # PENTING: frame rate yang dipakai VideoWriter di atas (variabel `fps`)
-    # cuma ASUMSI di awal sesi (dari CAP_PROP_FPS stream, atau fallback
-    # 15.0) -- kecepatan NYATA membaca+memproses frame selama sesi live bisa
-    # jauh lebih lambat (mis. karena inferensi YOLO & jeda jaringan), jadi
-    # jumlah frame yang benar-benar tersimpan biasanya jauh lebih sedikit
-    # daripada fps*durasi yang dijadwalkan. Kalau file hasil di-transcode
-    # dengan frame rate asumsi itu apa adanya, videonya jadi "dipercepat"
-    # drastis (mis. sesi 10 menit jadi cuma video 2 menit) walau isi
-    # (jumlah kendaraan/hitungan zona) tetap representatif untuk durasi
-    # sesungguhnya. Perbaikannya: hitung frame rate SEBENARNYA dari total
-    # frame yang berhasil diproses dibagi waktu nyata yang benar-benar
-    # berlalu, lalu pakai itu saat transcode supaya durasi video akhir
-    # cocok dengan durasi sesi yang sebenarnya.
-    real_elapsed_seconds = (datetime.now(timezone.utc) - started_at).total_seconds()
-    actual_fps = (frame_idx / real_elapsed_seconds) if real_elapsed_seconds > 0 else fps
-
-    _transcode_to_h264(output_path, input_fps=actual_fps)
+    # PENTING: video di atas SUDAH ditulis dengan pacing waktu-nyata (lihat
+    # penjelasan lengkap di titik `writer.write` di dalam loop) -- frame
+    # rate yang dipakai VideoWriter (variabel `fps`) sudah konsisten dipakai
+    # untuk menentukan KAPAN setiap frame ditulis, jadi durasi & kecepatan
+    # video akhir SUDAH otomatis cocok dengan waktu nyata TANPA perlu
+    # dikoreksi ulang di sini (percobaan sebelumnya melabeli ulang dengan
+    # satu frame rate rata-rata malah membuat videonya terlihat "slow
+    # motion" -- lihat riwayat perbaikan).
+    _transcode_to_h264(output_path)
 
     return zone_tracker.direction_rows(), f"live/{req.job_id}/results/{output_filename}", safety_events_out
 
