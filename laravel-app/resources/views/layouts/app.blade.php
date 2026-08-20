@@ -16,6 +16,7 @@
                     <a href="{{ route('videos.index') }}" class="hover:text-white {{ request()->routeIs('videos.index') ? 'text-white' : '' }}">Unggah Video</a>
                     <a href="{{ route('locations.index') }}" class="hover:text-white {{ request()->routeIs('locations.*') ? 'text-white' : '' }}">Lokasi JPL</a>
                     <a href="{{ route('users.index') }}" class="hover:text-white {{ request()->routeIs('users.*') ? 'text-white' : '' }}">Kelola Pengguna</a>
+                    <a href="{{ route('files.index') }}" class="hover:text-white {{ request()->routeIs('files.*') ? 'text-white' : '' }}">File Video</a>
                 @else
                     <div class="relative group">
                         <button type="button" class="hover:text-white {{ request()->routeIs('dashboard.*') ? 'text-white' : '' }} flex items-center gap-1">
