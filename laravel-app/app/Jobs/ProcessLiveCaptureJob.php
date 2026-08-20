@@ -25,7 +25,18 @@ class ProcessLiveCaptureJob implements ShouldQueue
 
     public int $timeout = 60;
 
-    public function __construct(public Video $video, public LiveCaptureJob $job)
+    // PENTING: properti ini SENGAJA dinamai $liveCaptureJob, BUKAN $job.
+    // Trait InteractsWithQueue (dipakai di atas) sudah mendeklarasikan
+    // properti publik $job miliknya sendiri (instance queue job internal
+    // Laravel). Kalau properti milik class ini juga dinamai $job, PHP akan
+    // gagal MENG-COMPOSE class ini sama sekali (fatal error "define the
+    // same property ($job) ... definition differs and is considered
+    // incompatible") -- class-nya tidak akan pernah bisa dimuat, dan
+    // setiap kali di-dispatch ke queue, worker akan crash instan tanpa
+    // sempat masuk try/catch mana pun, sehingga job nyangkut permanen di
+    // status running/pending. Inilah penyebab sebenarnya deteksi live
+    // tidak pernah berjalan sama sekali.
+    public function __construct(public Video $video, public LiveCaptureJob $liveCaptureJob)
     {
     }
 
@@ -34,13 +45,13 @@ class ProcessLiveCaptureJob implements ShouldQueue
         $this->video->update(['status' => 'processing']);
 
         try {
-            $detector->dispatchLive($this->video, $this->job);
+            $detector->dispatchLive($this->video, $this->liveCaptureJob);
         } catch (Throwable $e) {
             $this->video->update([
                 'status' => 'failed',
                 'error_message' => $e->getMessage(),
             ]);
-            $this->job->update([
+            $this->liveCaptureJob->update([
                 'status' => 'failed',
                 'error_message' => $e->getMessage(),
             ]);
