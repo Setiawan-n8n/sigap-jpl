@@ -6,7 +6,7 @@ import time
 import traceback
 import uuid
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 import cv2
@@ -129,7 +129,20 @@ def process_live(req: ProcessLiveRequest):
     except ValueError:
         raise HTTPException(status_code=422, detail="Format finish_at tidak valid.")
 
-    if finish_at <= datetime.now():
+    # PENTING: Laravel mengirim finish_at/start_at sebagai ISO8601 DENGAN
+    # offset zona waktu (mis. "...+07:00"), jadi datetime.fromisoformat()
+    # di atas menghasilkan datetime timezone-AWARE. Membandingkannya
+    # langsung dengan datetime.now() (yang NAIVE/tanpa zona waktu) membuat
+    # Python melempar "TypeError: can't compare offset-naive and
+    # offset-aware datetimes" -- exception ini TIDAK ketangkap oleh
+    # `except ValueError` di atas, jadi lolos sebagai 500 Internal Server
+    # Error mentah ke Laravel. Ini penyebab sebenarnya endpoint ini selalu
+    # gagal dengan 500 setiap kali dicoba. Perbaikannya: samakan dulu
+    # menjadi timezone-aware sebelum dibandingkan.
+    if finish_at.tzinfo is None:
+        finish_at = finish_at.replace(tzinfo=timezone.utc)
+
+    if finish_at <= datetime.now(timezone.utc):
         raise HTTPException(status_code=422, detail="finish_at sudah lewat.")
 
     thread = threading.Thread(target=_process_live_video, args=(req, finish_at), daemon=True)
@@ -516,7 +529,12 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
     rider_track_ids: set = set()
     safety_events_out = []
 
-    started_at = datetime.now()
+    # PENTING: finish_at yang diterima di sini SUDAH timezone-aware (lihat
+    # normalisasi di endpoint /process-live). started_at & "now" di bawah
+    # HARUS ikut dibuat timezone-aware juga (bukan datetime.now() biasa),
+    # supaya perbandingan/pengurangan dengan finish_at tidak melempar
+    # TypeError "can't compare offset-naive and offset-aware datetimes".
+    started_at = datetime.now(timezone.utc)
     planned_seconds = max(1.0, (finish_at - started_at).total_seconds())
     last_progress_sent = -1
     frame_idx = 0
@@ -525,7 +543,7 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
 
     try:
         while True:
-            now = datetime.now()
+            now = datetime.now(timezone.utc)
             if now >= finish_at:
                 break
 
