@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\DashboardController;
+use App\Http\Controllers\FileManagerController;
 use App\Http\Controllers\JplLocationController;
 use App\Http\Controllers\LiveCaptureJobController;
 use App\Http\Controllers\UserController;
@@ -42,6 +43,15 @@ Route::middleware(['auth', 'admin'])->group(function () {
     Route::post('/users/{user}/toggle', [UserController::class, 'toggle'])->name('users.toggle');
     Route::post('/users/{user}/reset-password', [UserController::class, 'resetPassword'])->name('users.reset-password');
     Route::delete('/users/{user}', [UserController::class, 'destroy'])->name('users.destroy');
+
+    // Kelola file video fisik di server (lihat hasil deteksi & file upload
+    // mentah, ukurannya masing-masing, sisa ruang server, unduh & hapus) --
+    // lihat App\Http\Controllers\FileManagerController.
+    Route::get('/files', [FileManagerController::class, 'index'])->name('files.index');
+    Route::get('/files/{video}/download/{type}', [FileManagerController::class, 'download'])
+        ->name('files.download')->where('type', 'annotated|raw');
+    Route::delete('/files/{video}/{type}', [FileManagerController::class, 'destroy'])
+        ->name('files.destroy')->where('type', 'annotated|raw');
 });
 
 // Rute yang bisa diakses admin maupun user biasa: melihat detail & status
