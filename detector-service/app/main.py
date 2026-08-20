@@ -851,13 +851,21 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
     # video akhir SUDAH otomatis cocok dengan waktu nyata TANPA perlu
     # dikoreksi ulang di sini (percobaan sebelumnya melabeli ulang dengan
     # satu frame rate rata-rata malah membuat videonya terlihat "slow
-    # motion" -- lihat riwayat perbaikan).
-    _transcode_to_h264(output_path)
+    # motion" -- lihat riwayat perbaikan). `duration_seconds=planned_seconds`
+    # dikirim supaya batas waktu ffmpeg ikut melebar untuk sesi live yang
+    # panjang (lihat penjelasan lengkap di docstring _transcode_to_h264
+    # kenapa ini penting -- tanpa ini, sesi live panjang bisa menghasilkan
+    # video yang kosong/tidak bisa diputar walau hasil hitungan tetap benar).
+    _transcode_to_h264(output_path, duration_seconds=planned_seconds)
 
     return zone_tracker.direction_rows(), f"live/{req.job_id}/results/{output_filename}", safety_events_out
 
 
-def _transcode_to_h264(path: str, input_fps: Optional[float] = None) -> None:
+def _transcode_to_h264(
+    path: str,
+    input_fps: Optional[float] = None,
+    duration_seconds: Optional[float] = None,
+) -> None:
     """Re-encode video ke H.264 (codec "mp4v" hasil cv2.VideoWriter bisa
     ditulis, tapi TIDAK bisa diputar langsung di browser -- Chrome/Firefox/
     Safari hanya mendukung H.264/VP9/AV1 pada tag <video>). ffmpeg sudah
@@ -880,18 +888,52 @@ def _transcode_to_h264(path: str, input_fps: Optional[float] = None) -> None:
     untuk durasi sesungguhnya. Untuk mode unggah file (bukan live), tidak
     perlu koreksi ini karena frame rate yang dipakai VideoWriter sudah
     diambil langsung dari file sumber yang akurat.
+
+    duration_seconds (opsional): perkiraan durasi NYATA video yang akan
+    di-transcode (dipakai KHUSUS sesi live, lihat pemanggilan di
+    _run_live_detection) -- dipakai untuk memperlebar batas waktu (timeout)
+    ffmpeg di bawah. PENTING: sejak fps output sesi live dipatok tetap ke
+    15fps (lihat _run_live_detection), sesi live yang PANJANG (mis. lebih
+    dari ~1 jam) menghasilkan file mp4v mentah dengan JAUH lebih banyak
+    frame untuk di-encode ulang ke H.264 dibanding sebelumnya. Kalau
+    encoding-nya lebih lambat dari batas waktu TETAP 600 detik yang lama,
+    subprocess.run() di bawah akan MELEMPAR TimeoutExpired -- itu tertangkap
+    oleh except Exception di bawah dan HANYA dicatat ke log server (lihat
+    traceback.print_exc()), TIDAK pernah sampai ke pemanggilnya. Akibatnya
+    file mp4v MENTAH (yang gagal di-encode ke H.264) tetap dibiarkan apa
+    adanya di annotated_path, sesi tetap dilaporkan "completed" lengkap
+    dengan hasil hitungan zona (yang memang dihitung terpisah, tidak
+    bergantung pada video), TAPI videonya sendiri tidak bisa diputar sama
+    sekali di browser (thumbnail hitam, durasi 0:00) karena masih berformat
+    mp4v mentah, bukan H.264 -- inilah penyebab video kosong padahal hasil
+    hitungan tetap muncul. Perbaikannya dua bagian: (1) tambahkan
+    "-preset veryfast" di bawah supaya ffmpeg meng-encode jauh lebih cepat
+    (trade-off ukuran file sedikit lebih besar, wajar untuk kebutuhan ini),
+    dan (2) lebarkan batas waktunya mengikuti durasi videonya sendiri, bukan
+    angka tetap 600 detik yang bisa saja tidak cukup untuk sesi live yang
+    sangat panjang.
     """
     tmp_path = f"{path}.h264.tmp.mp4"
+    # Batas waktu ffmpeg: minimal 600 detik (10 menit, cukup untuk video
+    # unggahan biasa & sesi live pendek/menengah seperti sebelumnya), tapi
+    # kalau durasi videonya sendiri lebih panjang dari itu (sesi live lama),
+    # beri waktu dua kali lipat durasi videonya supaya encoding "-preset
+    # veryfast" (yang jauh lebih cepat dari real-time bahkan di CPU biasa)
+    # tetap punya ruang gerak yang wajar, bukan keburu dianggap gagal.
+    timeout_seconds = 600
+    if duration_seconds and duration_seconds > 0:
+        timeout_seconds = max(timeout_seconds, int(duration_seconds * 2))
     try:
         cmd = ["ffmpeg", "-y", "-loglevel", "error"]
         if input_fps and input_fps > 0:
             cmd += ["-r", f"{input_fps:.3f}"]
         cmd += [
             "-i", path,
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-c:v", "libx264", "-preset", "veryfast",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
             tmp_path,
         ]
-        subprocess.run(cmd, check=True, timeout=600)
+        subprocess.run(cmd, check=True, timeout=timeout_seconds)
         os.replace(tmp_path, path)
     except Exception:
         traceback.print_exc()
