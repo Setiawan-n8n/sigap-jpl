@@ -38,6 +38,38 @@ from .config import (
 )
 from .tracker import Zone, ZoneTracker, build_polygon, hex_to_bgr, track_color
 
+# Header User-Agent yang menyamar sebagai browser Chrome biasa -- dipakai
+# untuk SEMUA pembacaan stream CCTV (snapshot maupun live terus-menerus),
+# karena banyak proxy CCTV instansi (mis. ATCS pemda) menolak/membatasi
+# koneksi yang tidak "terlihat" seperti request browser biasa.
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _open_stream_capture(url: str):
+    """Buka cv2.VideoCapture ke stream live (HLS/RTSP/dll) dengan header
+    User-Agent browser terpasang.
+
+    PENTING: sebelumnya, pembacaan stream live di _run_live_detection
+    memakai cv2.VideoCapture(url) POLOS tanpa User-Agent sama sekali --
+    beda dengan _capture_snapshot() di bawah yang sudah lebih dulu memakai
+    ffmpeg dengan User-Agent Chrome, justru karena proxy CCTV instansi
+    (mis. ATCS pemda) diketahui menolak/membatasi koneksi tanpa User-Agent
+    browser (lihat komentar di _capture_snapshot). Ini kemungkinan besar
+    penyebab pembacaan stream live sering gagal/gagal terus-menerus di
+    tengah sesi (perlu sambung ulang berkali-kali) walau kamera & jaringan
+    baik-baik saja: proxy-nya menganggap koneksi dari OpenCV/FFmpeg polos
+    sebagai bot dan memblokir/membatasinya. OPENCV_FFMPEG_CAPTURE_OPTIONS
+    adalah cara OpenCV (backend FFmpeg) menerima opsi tambahan seperti
+    User-Agent -- dibaca ulang setiap kali VideoCapture dibuka, jadi aman
+    dipakai di sini maupun saat sambung ulang.
+    """
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"user_agent;{BROWSER_USER_AGENT}"
+    return cv2.VideoCapture(url)
+
+
 app = FastAPI(title="SIGAP-JPL Detector Service")
 
 print(f"Loading YOLO model: {MODEL_NAME}")
@@ -172,11 +204,7 @@ def _capture_snapshot(url: str):
     else:
         # Banyak proxy CCTV instansi (mis. ATCS pemda) menolak request tanpa
         # User-Agent yang terlihat seperti browser biasa (dianggap bot).
-        cmd += [
-            "-user_agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        ]
+        cmd += ["-user_agent", BROWSER_USER_AGENT]
 
     cmd += ["-i", url, "-frames:v", "1", "-q:v", "2", out_path]
 
@@ -551,7 +579,7 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
     base_dt = _parse_recorded_at(req.start_at)
     wanted_ids = [cid for cid, name in TARGET_CLASSES.items() if name in req.classes]
 
-    cap = cv2.VideoCapture(req.stream_url)
+    cap = _open_stream_capture(req.stream_url)
     if not cap.isOpened():
         raise RuntimeError("Tidak dapat membuka stream CCTV. Periksa kembali URL-nya.")
 
@@ -631,7 +659,7 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
                         break
 
                     cap.release()
-                    cap = cv2.VideoCapture(req.stream_url)
+                    cap = _open_stream_capture(req.stream_url)
                     consecutive_failures = 0
                     time.sleep(1.0)
                     continue
