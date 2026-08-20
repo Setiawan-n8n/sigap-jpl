@@ -587,7 +587,24 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
     last_progress_sent = -1
     frame_idx = 0
     consecutive_failures = 0
-    max_consecutive_failures = int(fps * 20)  # ~20 detik tanpa frame -> anggap stream putus
+    # PENTING: sebelumnya, begitu pembacaan gagal terus-menerus selama
+    # ~20 detik, kode langsung MENYERAH (break) dan melaporkan sesi sebagai
+    # "completed" seolah berjalan normal -- padahal videonya jadi terpotong
+    # jauh lebih pendek dari rentang waktu yang dijadwalkan (mis. dijadwalkan
+    # 10 menit, tapi cuma dapat ~10 detik rekaman). Penyebabnya: stream live
+    # (HLS/.m3u8) punya "jendela" segmen yang terus bergeser seiring waktu;
+    # cv2.VideoCapture yang dibuka SEKALI di awal tidak selalu ikut
+    # menyegarkan playlist-nya, jadi pembacaan bisa mulai gagal terus di
+    # tengah sesi walau kamera & jaringannya baik-baik saja. Perbaikannya:
+    # coba SAMBUNG ULANG (buka ulang koneksi ke stream_url, yang otomatis
+    # mengambil playlist live terbaru) begitu pembacaan mulai gagal
+    # berturut-turut, bukan langsung menyerah. Baru benar-benar berhenti
+    # kalau sambung ulang berkali-kali TETAP gagal selama lebih dari
+    # MAX_RECONNECT_SECONDS -- dan itu pun dilaporkan sebagai GAGAL (lihat
+    # pengecekan setelah loop di bawah), bukan "completed" diam-diam.
+    reconnect_after_failures = max(1, int(fps * 5))  # ~5 detik gagal berturut -> coba sambung ulang
+    reconnect_deadline = None  # None = belum dalam mode "sedang mencoba sambung ulang"
+    MAX_RECONNECT_SECONDS = 60.0
 
     try:
         while True:
@@ -598,13 +615,33 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
             ok, frame = cap.read()
             if not ok or frame is None:
                 consecutive_failures += 1
-                if consecutive_failures >= max_consecutive_failures:
-                    break
+
+                if consecutive_failures >= reconnect_after_failures:
+                    if reconnect_deadline is None:
+                        reconnect_deadline = now + timedelta(seconds=MAX_RECONNECT_SECONDS)
+                        print(
+                            f"[live:{req.job_id}] Pembacaan stream gagal berturut-turut, "
+                            f"mencoba sambung ulang...",
+                            flush=True,
+                        )
+                    elif now >= reconnect_deadline:
+                        # Sudah mencoba sambung ulang berulang kali selama lebih dari
+                        # MAX_RECONNECT_SECONDS tanpa hasil -- anggap stream benar-benar
+                        # tidak terjangkau, jangan coba lagi.
+                        break
+
+                    cap.release()
+                    cap = cv2.VideoCapture(req.stream_url)
+                    consecutive_failures = 0
+                    time.sleep(1.0)
+                    continue
+
                 # Beri jeda singkat lalu coba lagi -- stream live kadang
                 # sesaat tersendat (buffering jaringan), bukan berarti putus.
                 time.sleep(0.2)
                 continue
             consecutive_failures = 0
+            reconnect_deadline = None
 
             # Deteksi & tracking satu frame. persist=True menjaga ID track
             # tetap konsisten antar pemanggilan berturut-turut (sama seperti
@@ -710,6 +747,19 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
 
     if frame_idx == 0:
         raise RuntimeError("Tidak ada frame yang berhasil dibaca dari stream CCTV selama sesi ini.")
+
+    if datetime.now(timezone.utc) < finish_at:
+        # Loop berhenti BUKAN karena waktu terjadwal sudah habis, tapi karena
+        # sambung ulang stream (lihat di atas) tetap gagal setelah dicoba
+        # berkali-kali -- jangan laporkan sebagai "completed" seolah sesi
+        # berjalan penuh sampai waktu selesai, padahal terpotong di tengah
+        # jalan. Admin perlu tahu ini supaya bisa menjadwalkan ulang, bukan
+        # mengira hasil yang terpotong itu representasi 10 menit penuh.
+        raise RuntimeError(
+            f"Koneksi ke stream CCTV terputus & gagal disambungkan ulang setelah "
+            f"{frame_idx} frame berhasil diproses (~{frame_idx / fps:.0f} detik rekaman). "
+            f"Sesi dihentikan lebih awal, tidak sampai waktu selesai yang dijadwalkan."
+        )
 
     # rider_track_ids sudah final sekarang (sesi live sudah selesai) --
     # koreksi hitungan zona supaya pengendara/penumpang tidak ikut ter-tally
