@@ -19,6 +19,13 @@
         </p>
     </div>
 @else
+    {{-- Baris atas: daftar lokasi (sidebar sempit) + Tayangan CCTV. Panel
+         "Video Hasil Deteksi & Tracking" SENGAJA dipindah ke baris sendiri di
+         bawah (lebar penuh) -- kalau dipaksakan jadi kolom ke-3 di grid yang
+         sama, video hasil deteksi & grafiknya jadi kecil sekali (cuma ~1/3
+         lebar halaman, lalu terbagi dua lagi untuk video+grafik di dalam
+         _result_panel). Dengan lebar penuh di sini, ukurannya jadi sama besar
+         seperti tampilan di halaman detail video (videos/show.blade.php). --}}
     <div class="grid gap-8 lg:grid-cols-3">
         <div class="bg-white rounded-xl shadow p-6 lg:col-span-1">
             <h2 class="text-lg font-semibold mb-4">Lokasi Online ({{ $locations->count() }})</h2>
@@ -38,7 +45,7 @@
             </div>
         </div>
 
-        <div class="bg-white rounded-xl shadow p-6 lg:col-span-1">
+        <div class="bg-white rounded-xl shadow p-6 lg:col-span-2">
             <h2 class="text-lg font-semibold mb-4">Tayangan CCTV</h2>
             @if (! $selected)
                 <p class="text-sm text-slate-500">Pilih salah satu lokasi di sebelah kiri untuk menampilkan tayangan CCTV.</p>
@@ -67,77 +74,77 @@
                 </p>
             @endif
         </div>
+    </div>
 
-        <div class="lg:col-span-1">
-            @if (! $selected)
-                <div class="bg-white rounded-xl shadow p-6 h-full">
-                    <h2 class="text-lg font-semibold mb-1">Video Hasil Deteksi &amp; Tracking</h2>
-                    <p class="text-sm text-slate-500">Pilih salah satu lokasi di sebelah kiri untuk menampilkan hasil deteksi live.</p>
-                </div>
-            @elseif ($liveVideo)
-                @include('videos._result_panel', ['video' => $liveVideo, 'liveFinishAt' => $liveJob->finish_at])
-            @elseif ($liveJob && $liveJob->status === 'scheduled')
-                <div class="bg-white rounded-xl shadow p-6 h-full">
-                    <h2 class="text-lg font-semibold mb-1">Video Hasil Deteksi &amp; Tracking</h2>
-                    <p class="text-sm text-slate-500 mb-3">Deteksi live untuk lokasi ini sudah dijadwalkan, belum dimulai.</p>
-                    <div class="rounded-lg border p-3 text-sm">
-                        <div class="font-medium mb-1">Terjadwal</div>
-                        <div class="text-slate-500 text-xs">
-                            {{ $liveJob->start_at->format('d M Y H:i') }} — {{ $liveJob->finish_at->format('d M Y H:i') }}
-                        </div>
+    <div class="mt-8">
+        @if (! $selected)
+            <div class="bg-white rounded-xl shadow p-6 h-full">
+                <h2 class="text-lg font-semibold mb-1">Video Hasil Deteksi &amp; Tracking</h2>
+                <p class="text-sm text-slate-500">Pilih salah satu lokasi di sebelah kiri untuk menampilkan hasil deteksi live.</p>
+            </div>
+        @elseif ($liveVideo)
+            @include('videos._result_panel', ['video' => $liveVideo, 'liveFinishAt' => $liveJob->finish_at])
+        @elseif ($liveJob && $liveJob->status === 'scheduled')
+            <div class="bg-white rounded-xl shadow p-6 h-full">
+                <h2 class="text-lg font-semibold mb-1">Video Hasil Deteksi &amp; Tracking</h2>
+                <p class="text-sm text-slate-500 mb-3">Deteksi live untuk lokasi ini sudah dijadwalkan, belum dimulai.</p>
+                <div class="rounded-lg border p-3 text-sm">
+                    <div class="font-medium mb-1">Terjadwal</div>
+                    <div class="text-slate-500 text-xs">
+                        {{ $liveJob->start_at->format('d M Y H:i') }} — {{ $liveJob->finish_at->format('d M Y H:i') }}
                     </div>
-                    <p class="text-xs text-slate-400 mt-3">
-                        Halaman ini akan otomatis diperbarui saat waktu mulai tiba -- tidak perlu refresh manual.
-                    </p>
                 </div>
-                <script>
-                    (function () {
-                        // PENTING: jangan pakai location.reload() berkala di sini -- itu
-                        // ikut me-restart <video> Tayangan CCTV di kolom sebelah tiap kali
-                        // dipanggil (video-nya jadi terputus-putus / "hidup mati"). Sebagai
-                        // gantinya, cek status lewat endpoint JSON ringan di background
-                        // (tidak menyentuh DOM tayangan CCTV sama sekali), dan HANYA
-                        // reload sekali, persis saat statusnya benar-benar berubah.
-                        const statusUrl = "{{ route('dashboard.online.status') }}?lokasi={{ $selected->id }}";
-                        const initialStatus = "{{ $liveJob->status }}";
-                        const startAt = new Date("{{ $liveJob->start_at->toIso8601String() }}").getTime();
+                <p class="text-xs text-slate-400 mt-3">
+                    Halaman ini akan otomatis diperbarui saat waktu mulai tiba -- tidak perlu refresh manual.
+                </p>
+            </div>
+            <script>
+                (function () {
+                    // PENTING: jangan pakai location.reload() berkala di sini -- itu
+                    // ikut me-restart <video> Tayangan CCTV di kolom sebelah tiap kali
+                    // dipanggil (video-nya jadi terputus-putus / "hidup mati"). Sebagai
+                    // gantinya, cek status lewat endpoint JSON ringan di background
+                    // (tidak menyentuh DOM tayangan CCTV sama sekali), dan HANYA
+                    // reload sekali, persis saat statusnya benar-benar berubah.
+                    const statusUrl = "{{ route('dashboard.online.status') }}?lokasi={{ $selected->id }}";
+                    const initialStatus = "{{ $liveJob->status }}";
+                    const startAt = new Date("{{ $liveJob->start_at->toIso8601String() }}").getTime();
 
-                        async function check() {
-                            try {
-                                const res = await fetch(statusUrl);
-                                const data = await res.json();
-                                if (data.status !== initialStatus) {
-                                    location.reload();
-                                    return;
-                                }
-                            } catch (e) {
-                                console.error(e);
+                    async function check() {
+                        try {
+                            const res = await fetch(statusUrl);
+                            const data = await res.json();
+                            if (data.status !== initialStatus) {
+                                location.reload();
+                                return;
                             }
-
-                            const msUntilStart = startAt - Date.now();
-                            const delay = msUntilStart > 5 * 60000 ? 20000
-                                        : msUntilStart > 60000 ? 8000
-                                        : 3000;
-                            setTimeout(check, delay);
+                        } catch (e) {
+                            console.error(e);
                         }
 
-                        check();
-                    })();
-                </script>
-            @else
-                <div class="bg-white rounded-xl shadow p-6 h-full">
-                    <h2 class="text-lg font-semibold mb-1">Video Hasil Deteksi &amp; Tracking</h2>
-                    <p class="text-sm text-slate-500">
-                        Belum ada jadwal deteksi live untuk lokasi ini.
-                        @if (auth()->user()->isAdmin())
-                            Buka menu <a href="{{ route('locations.index') }}" class="underline">Lokasi JPL</a> untuk menjadwalkannya.
-                        @else
-                            Hubungi Administrator untuk menjadwalkannya.
-                        @endif
-                    </p>
-                </div>
-            @endif
-        </div>
+                        const msUntilStart = startAt - Date.now();
+                        const delay = msUntilStart > 5 * 60000 ? 20000
+                                    : msUntilStart > 60000 ? 8000
+                                    : 3000;
+                        setTimeout(check, delay);
+                    }
+
+                    check();
+                })();
+            </script>
+        @else
+            <div class="bg-white rounded-xl shadow p-6 h-full">
+                <h2 class="text-lg font-semibold mb-1">Video Hasil Deteksi &amp; Tracking</h2>
+                <p class="text-sm text-slate-500">
+                    Belum ada jadwal deteksi live untuk lokasi ini.
+                    @if (auth()->user()->isAdmin())
+                        Buka menu <a href="{{ route('locations.index') }}" class="underline">Lokasi JPL</a> untuk menjadwalkannya.
+                    @else
+                        Hubungi Administrator untuk menjadwalkannya.
+                    @endif
+                </p>
+            </div>
+        @endif
     </div>
 @endif
 @endsection
