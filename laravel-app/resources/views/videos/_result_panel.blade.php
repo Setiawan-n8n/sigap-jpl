@@ -174,7 +174,18 @@
     }
 
     async function poll() {
-        if (!polling) return;
+        // PENTING: JANGAN "if (!polling) return;" di sini. $video->status bisa
+        // saja SUDAH "completed"/"failed" sejak halaman pertama kali dibuka
+        // (mis. buka lagi Dashboard Online / halaman detail video setelah
+        // deteksinya lama selesai, bukan sedang menonton prosesnya
+        // berlangsung). Kalau baris itu ada, poll() langsung berhenti tanpa
+        // pernah fetch sama sekali, sehingga tabel "Rincian per Zona" & grafik
+        // "Total per Kategori" tidak pernah terisi walau video hasil deteksi
+        // sudah tampil (video-nya sendiri dirender langsung dari Blade, tapi
+        // totals/safety_events HANYA diisi lewat JS di sini). Jadi selalu
+        // fetch dulu minimal sekali; render() sendiri yang akan mematikan
+        // `polling` untuk status completed/failed, sehingga tidak akan
+        // dijadwalkan ulang.
         try {
             const res = await fetch(statusUrl);
             const data = await res.json();
