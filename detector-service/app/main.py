@@ -797,12 +797,28 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
     for ev in safety_events_out:
         ev.pop("frame_idx", None)
 
-    _transcode_to_h264(output_path)
+    # PENTING: frame rate yang dipakai VideoWriter di atas (variabel `fps`)
+    # cuma ASUMSI di awal sesi (dari CAP_PROP_FPS stream, atau fallback
+    # 15.0) -- kecepatan NYATA membaca+memproses frame selama sesi live bisa
+    # jauh lebih lambat (mis. karena inferensi YOLO & jeda jaringan), jadi
+    # jumlah frame yang benar-benar tersimpan biasanya jauh lebih sedikit
+    # daripada fps*durasi yang dijadwalkan. Kalau file hasil di-transcode
+    # dengan frame rate asumsi itu apa adanya, videonya jadi "dipercepat"
+    # drastis (mis. sesi 10 menit jadi cuma video 2 menit) walau isi
+    # (jumlah kendaraan/hitungan zona) tetap representatif untuk durasi
+    # sesungguhnya. Perbaikannya: hitung frame rate SEBENARNYA dari total
+    # frame yang berhasil diproses dibagi waktu nyata yang benar-benar
+    # berlalu, lalu pakai itu saat transcode supaya durasi video akhir
+    # cocok dengan durasi sesi yang sebenarnya.
+    real_elapsed_seconds = (datetime.now(timezone.utc) - started_at).total_seconds()
+    actual_fps = (frame_idx / real_elapsed_seconds) if real_elapsed_seconds > 0 else fps
+
+    _transcode_to_h264(output_path, input_fps=actual_fps)
 
     return zone_tracker.direction_rows(), f"live/{req.job_id}/results/{output_filename}", safety_events_out
 
 
-def _transcode_to_h264(path: str) -> None:
+def _transcode_to_h264(path: str, input_fps: Optional[float] = None) -> None:
     """Re-encode video ke H.264 (codec "mp4v" hasil cv2.VideoWriter bisa
     ditulis, tapi TIDAK bisa diputar langsung di browser -- Chrome/Firefox/
     Safari hanya mendukung H.264/VP9/AV1 pada tag <video>). ffmpeg sudah
@@ -810,19 +826,33 @@ def _transcode_to_h264(path: str) -> None:
     tempat, menimpa file mp4v dengan versi H.264 yang bisa diputar di browser.
     Kalau ffmpeg gagal/tidak ada, file mp4v asli tetap dibiarkan (annotated
     video tetap tersimpan, hanya tidak bisa diputar langsung di browser).
+
+    input_fps (opsional): dipakai KHUSUS untuk sesi live (lihat pemanggilan
+    di _run_live_detection) -- memaksa ffmpeg membaca ulang file mp4v
+    seolah-olah frame rate aslinya adalah input_fps, BUKAN frame rate yang
+    (salah) tertulis di metadata file mp4v hasil cv2.VideoWriter. PENTING:
+    untuk sesi live, jumlah frame yang benar-benar berhasil ditulis per
+    detik NYATA bisa jauh lebih rendah daripada frame rate yang diasumsikan
+    saat VideoWriter dibuat di awal (mis. diasumsikan 15 fps, padahal
+    kecepatan nyata membaca+memproses stream cuma ~3 fps karena inferensi
+    YOLO & jeda jaringan) -- tanpa koreksi ini, video hasil akhir jadi
+    "dipercepat" jauh dari kenyataan (mis. sesi 10 menit jadi video 2
+    menit), padahal jumlah frame yang tersimpan sebenarnya representatif
+    untuk durasi sesungguhnya. Untuk mode unggah file (bukan live), tidak
+    perlu koreksi ini karena frame rate yang dipakai VideoWriter sudah
+    diambil langsung dari file sumber yang akurat.
     """
     tmp_path = f"{path}.h264.tmp.mp4"
     try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-i", path,
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                tmp_path,
-            ],
-            check=True,
-            timeout=600,
-        )
+        cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+        if input_fps and input_fps > 0:
+            cmd += ["-r", f"{input_fps:.3f}"]
+        cmd += [
+            "-i", path,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            tmp_path,
+        ]
+        subprocess.run(cmd, check=True, timeout=600)
         os.replace(tmp_path, path)
     except Exception:
         traceback.print_exc()
