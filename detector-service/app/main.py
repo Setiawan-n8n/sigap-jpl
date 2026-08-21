@@ -70,6 +70,108 @@ def _open_stream_capture(url: str):
     return cv2.VideoCapture(url)
 
 
+class _LiveStreamReader:
+    """Background reader untuk stream CCTV live -- dipakai KHUSUS oleh
+    _run_live_detection (bukan _run_detection, yang membaca file lokal yang
+    bisa dibaca ulang & tidak punya masalah ini).
+
+    MASALAH SEBELUMNYA: kode lama memanggil cap.read() langsung di loop
+    utama yang sama dengan inferensi YOLO. cv2.VideoCapture (backend
+    FFmpeg) MENGANTRE frame yang berhasil diunduh dari jaringan dan
+    mengembalikannya berurutan lewat read() -- BUKAN selalu frame TERBARU.
+    Kalau inferensi YOLO lebih lambat dari frame rate asli stream (sangat
+    umum di CPU, YOLOv8 bisa <10fps padahal CCTV aslinya 25fps), antrean
+    ini terus MENUMPUK sepanjang sesi: setiap read() memang tetap
+    mengembalikan frame "berikutnya" secara berurutan (jarak KONTEN antar
+    frame yang berhasil diproses tetap rapat, mis. 1/25 detik), tapi posisi
+    frame itu makin lama makin TERTINGGAL JAUH dari live sebenarnya.
+
+    Karena video output tetap dipacing mengikuti waktu NYATA yang berlalu
+    (supaya durasi totalnya benar -- lihat writer.write() di
+    _run_live_detection), jarak konten yang sempit antar frame yang
+    diproses itu jadi "direntangkan" ke jarak waktu nyata yang jauh lebih
+    lebar (mengikuti kecepatan proses YOLO yang lebih lambat dari frame
+    rate asli stream) -- inilah akar penyebab video hasil sesi live
+    terlihat SLOW MOTION walau durasi totalnya sudah benar.
+
+    PERBAIKAN: baca stream di THREAD TERPISAH secara terus-menerus
+    (secepat jaringan/decoder mengizinkan), tapi loop pemrosesan utama
+    (YOLO + gambar + tulis) HANYA mengambil frame PALING BARU yang
+    tersedia setiap kali siap memproses -- frame lama yang belum sempat
+    diproses saat frame baru sudah datang otomatis DIBUANG (bukan
+    diantre). Ini membuat setiap frame yang benar-benar diproses & digambar
+    selalu (mendekati) posisi live sebenarnya, sehingga pergerakan yang
+    tampil di video hasil deteksi sinkron dengan kecepatan asli lalu
+    lintas. Konsekuensi yang inheren (bukan bug): jumlah frame KONTEN
+    UNIK yang terekam per detik dibatasi oleh kecepatan YOLO (bukan frame
+    rate asli CCTV) -- video hasil akan terlihat kurang mulus/"steppy"
+    dibanding tayangan live aslinya kalau YOLO jauh lebih lambat dari
+    frame rate stream, tapi WAKTUNYA (kapan sesuatu terjadi) selalu benar.
+    """
+
+    def __init__(self, stream_url: str):
+        self._stream_url = stream_url
+        self._cap = _open_stream_capture(stream_url)
+        self._lock = threading.Lock()
+        self._frame = None
+        self._seq = 0
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def isOpened(self) -> bool:
+        return self._cap is not None and self._cap.isOpened()
+
+    def get(self, prop_id):
+        return self._cap.get(prop_id) if self._cap is not None else 0
+
+    def _run(self):
+        while not self._stopped:
+            cap = self._cap
+            if cap is None or not cap.isOpened():
+                time.sleep(0.2)
+                continue
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                # Jeda singkat supaya tidak busy-loop kalau stream sedang
+                # benar-benar putus (bukan cuma sesaat tersendat). Kegagalan
+                # yang berkepanjangan otomatis terdeteksi lewat "tidak ada
+                # frame baru" di sisi pemanggil (lihat latest()), tidak perlu
+                # dihitung terpisah di sini.
+                time.sleep(0.05)
+                continue
+            with self._lock:
+                self._frame = frame
+                self._seq += 1
+
+    def latest(self, last_seen_seq: int):
+        """Kembalikan (frame, seq) HANYA kalau ada frame BARU (seq lebih
+        besar dari last_seen_seq) sejak terakhir diambil pemanggil; kalau
+        belum ada yang baru, kembalikan (None, last_seen_seq) -- pemanggil
+        tinggal menunggu sebentar & coba lagi (lihat pemakaian di
+        _run_live_detection)."""
+        with self._lock:
+            if self._frame is not None and self._seq > last_seen_seq:
+                return self._frame, self._seq
+            return None, last_seen_seq
+
+    def reconnect(self):
+        """Buka ulang koneksi ke stream_url (mis. untuk menyegarkan
+        playlist HLS yang jendelanya sudah bergeser -- sama seperti alasan
+        reconnect di kode lama)."""
+        old_cap = self._cap
+        self._cap = _open_stream_capture(self._stream_url)
+        if old_cap is not None:
+            old_cap.release()
+
+    def release(self):
+        self._stopped = True
+        self._thread.join(timeout=2)
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+
+
 app = FastAPI(title="SIGAP-JPL Detector Service")
 
 print(f"Loading YOLO model: {MODEL_NAME}")
@@ -579,26 +681,29 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
     base_dt = _parse_recorded_at(req.start_at)
     wanted_ids = [cid for cid, name in TARGET_CLASSES.items() if name in req.classes]
 
-    cap = _open_stream_capture(req.stream_url)
-    if not cap.isOpened():
+    # PENTING (fix slow motion): stream dibaca lewat _LiveStreamReader (thread
+    # tersendiri, lihat class-nya) yang selalu menyediakan frame PALING BARU --
+    # bukan lagi cv2.VideoCapture yang dibaca langsung di loop utama, yang
+    # antreannya bisa menumpuk kalau YOLO lebih lambat dari frame rate asli
+    # stream (lihat penjelasan lengkap di docstring _LiveStreamReader kenapa
+    # itu penyebab video hasil sesi live terlihat slow motion).
+    reader = _LiveStreamReader(req.stream_url)
+    if not reader.isOpened():
+        reader.release()
         raise RuntimeError("Tidak dapat membuka stream CCTV. Periksa kembali URL-nya.")
 
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
+    width = int(reader.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
+    height = int(reader.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
     # PENTING: SENGAJA tidak lagi memakai cap.get(cv2.CAP_PROP_FPS) sama
     # sekali untuk sesi live. Banyak stream live (HLS/RTSP relay, termasuk
     # proxy ATCS) melaporkan angka FPS yang "valid" secara teknis (lolos
     # pengecekan wajar) tapi jauh lebih rendah dari kenyataan (mis. 5-8
     # fps) -- padahal angka inilah yang menentukan frame rate video hasil
-    # akhir (lihat pacing di bawah). Video yang dideklarasikan di frame
-    # rate serendah itu terlihat "patah-patah"/lambat ke mata manusia,
-    # BUKAN karena durasinya salah (itu sudah diperbaiki lewat pacing di
-    # bawah), tapi karena frame rate videonya sendiri terlalu rendah untuk
-    # terlihat mulus dibanding tayangan CCTV aslinya. Karena penulisan
-    # video sekarang sudah dipacing mengikuti waktu nyata (bukan lagi
-    # bergantung pada frame rate asli sumbernya untuk akurasi durasi),
-    # aman & lebih baik untuk selalu pakai angka frame rate output yang
-    # wajar & konsisten, terlepas dari apa pun yang dilaporkan stream-nya.
+    # akhir (lihat pacing di bawah). Karena penulisan video sekarang sudah
+    # dipacing mengikuti waktu nyata (bukan lagi bergantung pada frame rate
+    # asli sumbernya untuk akurasi durasi), aman & lebih baik untuk selalu
+    # pakai angka frame rate output yang wajar & konsisten, terlepas dari
+    # apa pun yang dilaporkan stream-nya.
     fps = 15.0
 
     zones = []
@@ -629,26 +734,20 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
     # YOLO berhasil dijalankan (dipakai ZoneTracker & penandaan safety
     # event); output_frames_written menghitung berapa frame yang SUDAH
     # benar-benar ditulis ke video, DIPAKSA mengikuti waktu NYATA yang
-    # berlalu supaya video akhir tidak "slow motion".
+    # berlalu supaya DURASI video akhir tidak meleset (lihat juga
+    # _LiveStreamReader untuk kenapa durasi yang benar saja tidak cukup --
+    # KONTEN yang ditulis juga harus selalu dekat posisi live, bukan cuma
+    # totalnya yang pas).
     output_frames_written = 0
-    consecutive_failures = 0
-    # PENTING: sebelumnya, begitu pembacaan gagal terus-menerus selama
-    # ~20 detik, kode langsung MENYERAH (break) dan melaporkan sesi sebagai
-    # "completed" seolah berjalan normal -- padahal videonya jadi terpotong
-    # jauh lebih pendek dari rentang waktu yang dijadwalkan (mis. dijadwalkan
-    # 10 menit, tapi cuma dapat ~10 detik rekaman). Penyebabnya: stream live
-    # (HLS/.m3u8) punya "jendela" segmen yang terus bergeser seiring waktu;
-    # cv2.VideoCapture yang dibuka SEKALI di awal tidak selalu ikut
-    # menyegarkan playlist-nya, jadi pembacaan bisa mulai gagal terus di
-    # tengah sesi walau kamera & jaringannya baik-baik saja. Perbaikannya:
-    # coba SAMBUNG ULANG (buka ulang koneksi ke stream_url, yang otomatis
-    # mengambil playlist live terbaru) begitu pembacaan mulai gagal
-    # berturut-turut, bukan langsung menyerah. Baru benar-benar berhenti
-    # kalau sambung ulang berkali-kali TETAP gagal selama lebih dari
-    # MAX_RECONNECT_SECONDS -- dan itu pun dilaporkan sebagai GAGAL (lihat
-    # pengecekan setelah loop di bawah), bukan "completed" diam-diam.
-    reconnect_after_failures = max(1, int(fps * 5))  # ~5 detik gagal berturut -> coba sambung ulang
+
+    last_seen_seq = 0
+    last_new_frame_at = started_at
     reconnect_deadline = None  # None = belum dalam mode "sedang mencoba sambung ulang"
+    # Berapa lama TIDAK ADA frame baru sama sekali (dari _LiveStreamReader)
+    # sebelum mulai mencoba sambung ulang -- dicek berbasis waktu nyata
+    # (bukan hitungan percobaan baca seperti kode lama), supaya tidak
+    # tergantung seberapa sering loop utama sempat polling.
+    STALE_RECONNECT_AFTER = timedelta(seconds=5.0)
     MAX_RECONNECT_SECONDS = 60.0
 
     try:
@@ -657,16 +756,16 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
             if now >= finish_at:
                 break
 
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                consecutive_failures += 1
+            frame, seq = reader.latest(last_seen_seq)
 
-                if consecutive_failures >= reconnect_after_failures:
+            if frame is None:
+                stale_for = now - last_new_frame_at
+                if stale_for >= STALE_RECONNECT_AFTER:
                     if reconnect_deadline is None:
                         reconnect_deadline = now + timedelta(seconds=MAX_RECONNECT_SECONDS)
                         print(
-                            f"[live:{req.job_id}] Pembacaan stream gagal berturut-turut, "
-                            f"mencoba sambung ulang...",
+                            f"[live:{req.job_id}] Tidak ada frame baru selama "
+                            f"{stale_for.total_seconds():.0f} detik, mencoba sambung ulang...",
                             flush=True,
                         )
                     elif now >= reconnect_deadline:
@@ -675,17 +774,20 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
                         # tidak terjangkau, jangan coba lagi.
                         break
 
-                    cap.release()
-                    cap = _open_stream_capture(req.stream_url)
-                    consecutive_failures = 0
+                    reader.reconnect()
+                    last_seen_seq = 0
+                    last_new_frame_at = now  # beri kesempatan sebelum dianggap basi lagi
                     time.sleep(1.0)
                     continue
 
-                # Beri jeda singkat lalu coba lagi -- stream live kadang
-                # sesaat tersendat (buffering jaringan), bukan berarti putus.
-                time.sleep(0.2)
+                # Belum lama/belum jadi masalah -- stream live memang wajar
+                # sesekali belum punya frame baru (segmen berikutnya belum
+                # sampai). Ini BUKAN kegagalan.
+                time.sleep(0.05)
                 continue
-            consecutive_failures = 0
+
+            last_seen_seq = seq
+            last_new_frame_at = now
             reconnect_deadline = None
 
             # Deteksi & tracking satu frame. persist=True menjaga ID track
@@ -715,25 +817,25 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
                         continue
                     frame_boxes.append((int(tid), class_name, box))
 
-                vehicle_boxes = [b for _, cn, b in frame_boxes if cn in RIDER_HOST_CLASSES]
-                if vehicle_boxes:
-                    for tid, cn, box in frame_boxes:
-                        if cn != "person" or tid in rider_track_ids:
-                            continue
-                        if any(_is_riding(box, vbox) for vbox in vehicle_boxes):
-                            rider_track_ids.add(tid)
+            vehicle_boxes = [b for _, cn, b in frame_boxes if cn in RIDER_HOST_CLASSES]
+            if vehicle_boxes:
+                for tid, cn, box in frame_boxes:
+                    if cn != "person" or tid in rider_track_ids:
+                        continue
+                    if any(_is_riding(box, vbox) for vbox in vehicle_boxes):
+                        rider_track_ids.add(tid)
 
-                # Sama seperti di _run_detection: pakai titik tengah-BAWAH
-                # kotak (bottom-center) untuk uji zona, bukan titik tengah
-                # geometris kotak -- lihat penjelasan lengkap di sana.
-                zone_dets = []
-                for track_id, class_name, box in frame_boxes:
-                    x1, y1, x2, y2 = box
-                    cx, cy = (x1 + x2) / 2, y2
-                    zone_dets.append((track_id, class_name, cx, cy))
-                new_events = zone_tracker.update(frame_idx, zone_dets)
-                for ev in new_events:
-                    safety_events_out.append(ev)
+            # Sama seperti di _run_detection: pakai titik tengah-BAWAH
+            # kotak (bottom-center) untuk uji zona, bukan titik tengah
+            # geometris kotak -- lihat penjelasan lengkap di sana.
+            zone_dets = []
+            for track_id, class_name, box in frame_boxes:
+                x1, y1, x2, y2 = box
+                cx, cy = (x1 + x2) / 2, y2
+                zone_dets.append((track_id, class_name, cx, cy))
+            new_events = zone_tracker.update(frame_idx, zone_dets)
+            for ev in new_events:
+                safety_events_out.append(ev)
 
             overlay = frame.copy()
             for zone, zs in zip(zones, req.zones):
@@ -778,24 +880,18 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
                 cv2.imwrite(snap_path, frame)
                 ev["snapshot_path"] = f"live/{req.job_id}/results/snapshots/{snap_name}"
 
-            # PENTING: sebelumnya, satu frame yang berhasil diproses = satu
-            # frame ditulis ke video, TANPA memperhitungkan berapa lama
-            # waktu NYATA yang benar-benar berlalu untuk memproses frame
-            # itu (mis. karena inferensi YOLO/jaringan naik-turun
-            # kecepatannya). Video akhir sempat "diperbaiki" durasinya
-            # dengan melabeli ulang SATU frame rate rata-rata untuk
-            # seluruh video (lihat riwayat perbaikan sebelumnya) -- itu
-            # membuat TOTAL durasi cocok, tapi gerakan di dalam videonya
-            # jadi terlihat "slow motion" (frame rate rata-rata itu
-            # dipaksakan rata ke seluruh video, padahal kecepatan
-            # pemrosesan nyata naik-turun sepanjang sesi). Perbaikan yang
-            # benar: TULIS frame mengikuti waktu NYATA yang berlalu, bukan
+            # PENTING: TULIS frame mengikuti waktu NYATA yang berlalu, bukan
             # sekadar sekali per frame yang berhasil diproses -- kalau
             # pemrosesan frame ini memakan waktu lebih dari 1/fps detik,
             # ulangi (duplikasi) frame yang sama untuk mengisi "jeda" itu
             # sampai video mengejar waktu nyata, persis seperti cara kerja
             # perekam CCTV biasa saat sesaat tersendat (menahan frame
             # terakhir, bukan mempercepat/memperlambat seluruh rekaman).
+            # Sekarang frame yang ditahan/diduplikasi ini juga selalu
+            # (mendekati) frame live TERBARU (lihat _LiveStreamReader),
+            # bukan lagi frame lama yang tertinggal jauh dari backlog --
+            # itulah yang sebelumnya membuat gerakan di videonya terlihat
+            # slow motion walau durasi totalnya sudah benar.
             now_after_processing = datetime.now(timezone.utc)
             elapsed = (now_after_processing - started_at).total_seconds()
             target_output_frames = int(elapsed * fps)
@@ -817,7 +913,7 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
             writer.write(frame)
             output_frames_written += 1
     finally:
-        cap.release()
+        reader.release()
         writer.release()
 
     if frame_idx == 0:
@@ -829,11 +925,12 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
         # berkali-kali -- jangan laporkan sebagai "completed" seolah sesi
         # berjalan penuh sampai waktu selesai, padahal terpotong di tengah
         # jalan. Admin perlu tahu ini supaya bisa menjadwalkan ulang, bukan
-        # mengira hasil yang terpotong itu representasi 10 menit penuh.
+        # mengira hasil yang terpotong itu representasi durasi penuh.
+        elapsed_before_failure = (datetime.now(timezone.utc) - started_at).total_seconds()
         raise RuntimeError(
             f"Koneksi ke stream CCTV terputus & gagal disambungkan ulang setelah "
-            f"{frame_idx} frame berhasil diproses (~{frame_idx / fps:.0f} detik rekaman). "
-            f"Sesi dihentikan lebih awal, tidak sampai waktu selesai yang dijadwalkan."
+            f"~{elapsed_before_failure:.0f} detik sesi berjalan. Sesi dihentikan lebih "
+            f"awal, tidak sampai waktu selesai yang dijadwalkan."
         )
 
     # rider_track_ids sudah final sekarang (sesi live sudah selesai) --
@@ -844,18 +941,15 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
     for ev in safety_events_out:
         ev.pop("frame_idx", None)
 
-    # PENTING: video di atas SUDAH ditulis dengan pacing waktu-nyata (lihat
-    # penjelasan lengkap di titik `writer.write` di dalam loop) -- frame
-    # rate yang dipakai VideoWriter (variabel `fps`) sudah konsisten dipakai
-    # untuk menentukan KAPAN setiap frame ditulis, jadi durasi & kecepatan
-    # video akhir SUDAH otomatis cocok dengan waktu nyata TANPA perlu
-    # dikoreksi ulang di sini (percobaan sebelumnya melabeli ulang dengan
-    # satu frame rate rata-rata malah membuat videonya terlihat "slow
-    # motion" -- lihat riwayat perbaikan). `duration_seconds=planned_seconds`
-    # dikirim supaya batas waktu ffmpeg ikut melebar untuk sesi live yang
-    # panjang (lihat penjelasan lengkap di docstring _transcode_to_h264
-    # kenapa ini penting -- tanpa ini, sesi live panjang bisa menghasilkan
-    # video yang kosong/tidak bisa diputar walau hasil hitungan tetap benar).
+    # PENTING: video di atas SUDAH ditulis dengan pacing waktu-nyata DAN
+    # selalu memakai frame yang (mendekati) posisi live sebenarnya (lihat
+    # _LiveStreamReader) -- frame rate yang dipakai VideoWriter (variabel
+    # `fps`) sudah konsisten dipakai untuk menentukan KAPAN setiap frame
+    # ditulis, jadi durasi & kecepatan video akhir SUDAH otomatis cocok
+    # dengan waktu nyata TANPA perlu dikoreksi ulang di sini.
+    # `duration_seconds=planned_seconds` dikirim supaya batas waktu ffmpeg
+    # ikut melebar untuk sesi live yang panjang (lihat penjelasan lengkap di
+    # docstring _transcode_to_h264).
     _transcode_to_h264(output_path, duration_seconds=planned_seconds)
 
     return zone_tracker.direction_rows(), f"live/{req.job_id}/results/{output_filename}", safety_events_out
