@@ -30,6 +30,8 @@ from .config import (
     CALLBACK_SECRET,
     CONF_THRESHOLD,
     DEFAULT_DANGER_DWELL_SECONDS,
+    LIVE_IMGSZ,
+    LIVE_MODEL_NAME,
     MODEL_NAME,
     RIDER_HOST_CLASSES,
     RIDER_X_MARGIN_RATIO,
@@ -218,8 +220,29 @@ class _LiveStreamReader:
 
 app = FastAPI(title="SIGAP-JPL Detector Service")
 
+# PENTING: pastikan PyTorch benar-benar memakai semua core CPU yang
+# tersedia untuk inferensi (bukan cuma 1 core) -- di dalam container,
+# jumlah thread default PyTorch kadang tidak terdeteksi dengan benar dari
+# limit cgroup, jadi disetel eksplisit ke jumlah core yang terlihat oleh
+# proses ini. Ini aman dipasang meski defaultnya sudah benar.
+try:
+    _cpu_count = os.cpu_count() or 1
+    torch.set_num_threads(_cpu_count)
+    print(f"torch.set_num_threads({_cpu_count})")
+except Exception:  # noqa: BLE001
+    traceback.print_exc()
+
 print(f"Loading YOLO model: {MODEL_NAME}")
 model = YOLO(MODEL_NAME)
+
+# Model KHUSUS sesi live -- lebih ringan dari `model` di atas supaya lebih
+# banyak frame UNIK per detik yang bisa diproses saat real-time (lihat
+# penjelasan lengkap di config.py & _run_live_detection). Mode unggah file
+# (_run_detection) SENGAJA tetap memakai `model` (yolov8s) di atas, bukan
+# `model_live`, karena tidak ada tekanan real-time di sana -- akurasi
+# lebih diutamakan.
+print(f"Loading YOLO model (khusus live, lebih ringan): {LIVE_MODEL_NAME}")
+model_live = YOLO(LIVE_MODEL_NAME)
 
 
 class ZoneSchema(BaseModel):
@@ -838,10 +861,31 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
             # tetap konsisten antar pemanggilan berturut-turut (sama seperti
             # stream=True pada mode unggah file, tapi di sini dipanggil
             # manual per-frame karena sumbernya bukan path file).
-            results = model.track(
+            #
+            # PENTING (fix video patah-patah/steppy): dipakai `model_live`
+            # (model lebih ringan, lihat config.py) + imgsz=LIVE_IMGSZ yang
+            # lebih kecil daripada `model` (dipakai mode unggah file) --
+            # BUKAN `model` biasa. Sebabnya: fps output dipatok 15fps &
+            # setiap frame yang telat diproses membuat frame SEBELUMNYA
+            # diduplikasi untuk mengejar waktu nyata (lihat blok
+            # writer.write di bawah) -- kalau inferensi per frame jauh
+            # lebih lambat dari 1/15 detik (yolov8s @ imgsz default di CPU
+            # 4 vCPU VPS ini bisa >300ms/frame, jauh dari ~67ms yang
+            # dibutuhkan untuk 15fps), jumlah frame UNIK yang benar-benar
+            # baru per detik jadi sangat sedikit dibanding frame duplikat
+            # -- itulah yang terlihat sebagai "patah-patah"/steppy di
+            # video hasil (gerakan meloncat, bukan mengalir), BUKAN bug
+            # dari fix race-condition sebelumnya (lihat _LiveStreamReader).
+            # Model & imgsz yang lebih ringan mengurangi waktu inferensi
+            # per frame supaya lebih banyak frame unik yang terkejar,
+            # dengan konsekuensi akurasi deteksi objek kecil/jauh sedikit
+            # lebih rendah -- trade-off yang bisa disetel lewat env var
+            # LIVE_MODEL_NAME/LIVE_IMGSZ tanpa perlu ubah kode ini.
+            results = model_live.track(
                 source=frame,
                 classes=wanted_ids,
                 conf=CONF_THRESHOLD,
+                imgsz=LIVE_IMGSZ,
                 tracker="bytetrack.yaml",
                 persist=True,
                 verbose=False,
