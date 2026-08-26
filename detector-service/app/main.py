@@ -111,6 +111,28 @@ class _LiveStreamReader:
 
     def __init__(self, stream_url: str):
         self._stream_url = stream_url
+        # PENTING (fix race condition): dua lock terpisah dengan tanggung
+        # jawab berbeda. _cap_lock melindungi SIKLUS HIDUP objek
+        # cv2.VideoCapture (`self._cap`) itu sendiri -- dipakai supaya
+        # reconnect()/release() TIDAK PERNAH memanggil .release() pada
+        # objek yang saat itu juga sedang di-.read() oleh thread _run().
+        # _lock (sudah ada sebelumnya) cuma melindungi _frame/_seq, tetap
+        # dipisah dari _cap_lock supaya latest() (dipanggil sangat sering
+        # dari loop utama) tidak pernah harus menunggu I/O jaringan dari
+        # cap.read() yang bisa berdurasi cukup lama.
+        #
+        # SEBELUMNYA (bug): _run() membaca `self._cap` lalu memanggil
+        # cap.read() tanpa lock sama sekali, sementara reconnect() (dipanggil
+        # dari thread lain) mengganti `self._cap` lalu langsung
+        # old_cap.release() -- juga tanpa lock. Kalau .release() itu
+        # kebetulan terjadi selagi _run() masih di tengah cap.read() pada
+        # objek yang SAMA, itu race condition di level objek C++ OpenCV/
+        # FFmpeg (undefined behavior), dan yang teramati di produksi adalah
+        # proses detector-service crash total (segfault diam-diam, tanpa
+        # traceback Python) lalu di-restart otomatis oleh Docker -- setiap
+        # kali itu terjadi, job live yang sedang berjalan kehilangan state-nya
+        # dan progress tidak pernah bisa maju.
+        self._cap_lock = threading.Lock()
         self._cap = _open_stream_capture(stream_url)
         self._lock = threading.Lock()
         self._frame = None
@@ -120,18 +142,31 @@ class _LiveStreamReader:
         self._thread.start()
 
     def isOpened(self) -> bool:
-        return self._cap is not None and self._cap.isOpened()
+        with self._cap_lock:
+            return self._cap is not None and self._cap.isOpened()
 
     def get(self, prop_id):
-        return self._cap.get(prop_id) if self._cap is not None else 0
+        with self._cap_lock:
+            return self._cap.get(prop_id) if self._cap is not None else 0
 
     def _run(self):
         while not self._stopped:
-            cap = self._cap
-            if cap is None or not cap.isOpened():
+            # PENTING: cek isOpened() DAN cap.read() dilakukan dalam SATU
+            # critical section _cap_lock yang sama -- supaya reconnect()
+            # (yang butuh _cap_lock yang sama untuk mengganti & me-release
+            # `self._cap`) tidak bisa menyelinap di tengah-tengah dan
+            # me-release objek yang sedang kita baca ini. reconnect() akan
+            # otomatis menunggu iterasi read() yang sedang berjalan selesai
+            # dulu sebelum boleh melanjutkan swap+release-nya.
+            with self._cap_lock:
+                cap = self._cap
+                if cap is None or not cap.isOpened():
+                    cap = None
+                else:
+                    ok, frame = cap.read()
+            if cap is None:
                 time.sleep(0.2)
                 continue
-            ok, frame = cap.read()
             if not ok or frame is None:
                 # Jeda singkat supaya tidak busy-loop kalau stream sedang
                 # benar-benar putus (bukan cuma sesaat tersendat). Kegagalan
@@ -158,18 +193,27 @@ class _LiveStreamReader:
     def reconnect(self):
         """Buka ulang koneksi ke stream_url (mis. untuk menyegarkan
         playlist HLS yang jendelanya sudah bergeser -- sama seperti alasan
-        reconnect di kode lama)."""
-        old_cap = self._cap
-        self._cap = _open_stream_capture(self._stream_url)
+        reconnect di kode lama).
+
+        PENTING: buka koneksi BARU dulu (operasi jaringan, di luar lock)
+        baru pegang _cap_lock sesaat untuk swap + release objek lama --
+        supaya thread _run() tidak pernah terhalang lock selama proses
+        _open_stream_capture() yang bisa memakan waktu, tapi tetap
+        terjamin tidak akan pernah menimpa objek yang sedang dibaca."""
+        new_cap = _open_stream_capture(self._stream_url)
+        with self._cap_lock:
+            old_cap = self._cap
+            self._cap = new_cap
         if old_cap is not None:
             old_cap.release()
 
     def release(self):
         self._stopped = True
         self._thread.join(timeout=2)
-        if self._cap is not None:
-            self._cap.release()
-            self._cap = None
+        with self._cap_lock:
+            cap, self._cap = self._cap, None
+        if cap is not None:
+            cap.release()
 
 
 app = FastAPI(title="SIGAP-JPL Detector Service")
