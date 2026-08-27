@@ -244,6 +244,37 @@ model = YOLO(MODEL_NAME)
 print(f"Loading YOLO model (khusus live, lebih ringan): {LIVE_MODEL_NAME}")
 model_live = YOLO(LIVE_MODEL_NAME)
 
+# PENTING (fix tracking "loncat-loncat"/tidak stabil saat >1 sesi berjalan
+# bersamaan): `model` dan `model_live` di atas adalah OBJEK GLOBAL TUNGGAL
+# yang dipakai bersama oleh SEMUA thread pemrosesan (_process_video &
+# _process_live_video masing-masing dijalankan di background thread-nya
+# sendiri per request -- lihat endpoint /process & /process-live). Kalau
+# ada 2+ video diunggah bersamaan, ATAU 2+ lokasi JPL menjalankan sesi live
+# terjadwal yang jam-nya tumpang tindih, beberapa thread akan memanggil
+# model.track()/model_live.track() PADA OBJEK YANG SAMA secara bersamaan.
+#
+# ultralytics menyimpan STATE tracker ByteTrack (mis. daftar track aktif
+# beserta ID-nya) menempel pada objek model itu sendiri (self.predictor),
+# BUKAN per-panggilan -- ini TIDAK aman dipakai dari banyak thread
+# sekaligus. Kalau dua thread memanggilnya bersamaan, state tracker milik
+# sesi A bisa tertimpa/tercampur dengan sesi B di tengah jalan: box
+# berpindah tempat, track ID meloncat/berganti mendadak, atau deteksi
+# muncul-hilang tidak wajar -- persis gejala "loncat-loncat"/tidak mulus
+# yang terlihat di video hasil, TERLEPAS dari seberapa cepat inferensinya.
+# Ini bug terpisah dari (dan bisa terjadi BERSAMAAN dengan) masalah
+# kecepatan inferensi CPU yang sudah ditangani lewat model_live/imgsz di
+# atas.
+#
+# Perbaikan: satu lock per model, membungkus SETIAP pemanggilan
+# .track()-nya (lihat pemakaian di _run_detection & _run_live_detection).
+# Konsekuensinya sesi-sesi yang tumpang tindih jadi diproses BERGANTIAN
+# (serial) alih-alih benar-benar paralel saat berebut model yang sama --
+# throughput sedikit menurun saat banyak sesi bersamaan, tapi jauh lebih
+# baik daripada tracking yang diam-diam korup tanpa pernah muncul sebagai
+# error apa pun.
+_model_lock = threading.Lock()
+_model_live_lock = threading.Lock()
+
 
 class ZoneSchema(BaseModel):
     name: str
@@ -550,78 +581,89 @@ def _run_detection(req: ProcessRequest):
     # ZoneTracker sempat mengumpulkan "suara" tiap track dari SELURUH video
     # dan tahu kelas final (mayoritas) tiap track sebelum video digambar.
     # =====================================================================
-    results = model.track(
-        source=req.video_path,
-        classes=wanted_ids,
-        conf=CONF_THRESHOLD,
-        tracker="bytetrack.yaml",
-        persist=True,
-        stream=True,
-        verbose=False,
-    )
-
     all_frame_detections: list = []  # index = frame_idx -> list[(track_id, class_name, box)]
 
     frame_idx = 0
-    for result in results:
-        frame_boxes = []  # (track_id, class_name, box)
-        boxes = result.boxes
-        if boxes is not None and boxes.id is not None:
-            xyxy = boxes.xyxy.cpu().numpy()
-            ids = boxes.id.cpu().numpy()
-            cls_ids = boxes.cls.cpu().numpy()
+    # PENTING: seluruh iterasi model.track(..., stream=True) dibungkus SATU
+    # lock (_model_lock) -- bukan cuma pemanggilan track() itu sendiri --
+    # karena `results` di sini adalah GENERATOR yang menjalankan inferensi
+    # per-frame secara LAZY tiap kali di-iterasi (bukan sekaligus di awal).
+    # Kalau lock hanya membungkus baris pemanggilan model.track() (yang
+    # instan, cuma bikin objek generator), thread lain tetap bisa menyelinap
+    # memakai `model` yang sama SELAGI generator ini masih diiterasi di
+    # loop for di bawah -- lock-nya jadi tidak berguna. Lihat penjelasan
+    # lengkap soal kenapa berbagi satu objek model antar-thread berbahaya di
+    # komentar dekat deklarasi _model_lock/_model_live_lock di atas.
+    with _model_lock:
+        results = model.track(
+            source=req.video_path,
+            classes=wanted_ids,
+            conf=CONF_THRESHOLD,
+            tracker="bytetrack.yaml",
+            persist=True,
+            stream=True,
+            verbose=False,
+        )
 
-            for box, tid, cls_id in zip(xyxy, ids, cls_ids):
-                class_name = TARGET_CLASSES.get(int(cls_id))
-                if class_name is None:
-                    continue
-                frame_boxes.append((int(tid), class_name, box))
+        for result in results:
+            frame_boxes = []  # (track_id, class_name, box)
+            boxes = result.boxes
+            if boxes is not None and boxes.id is not None:
+                xyxy = boxes.xyxy.cpu().numpy()
+                ids = boxes.id.cpu().numpy()
+                cls_ids = boxes.cls.cpu().numpy()
 
-            # Tandai "person" yang box-nya tumpang tindih signifikan dengan
-            # kendaraan sebagai pengendara/penumpang, bukan pejalan kaki.
-            vehicle_boxes = [b for _, cn, b in frame_boxes if cn in RIDER_HOST_CLASSES]
-            if vehicle_boxes:
-                for tid, cn, box in frame_boxes:
-                    if cn != "person" or tid in rider_track_ids:
+                for box, tid, cls_id in zip(xyxy, ids, cls_ids):
+                    class_name = TARGET_CLASSES.get(int(cls_id))
+                    if class_name is None:
                         continue
-                    if any(_is_riding(box, vbox) for vbox in vehicle_boxes):
-                        rider_track_ids.add(tid)
+                    frame_boxes.append((int(tid), class_name, box))
 
-            # Catat "suara" kelas & posisi tiap track untuk keperluan
-            # voting mayoritas & hitungan zona (lihat ZoneTracker.update).
-            #
-            # PENTING: titik yang diuji terhadap poligon zona sengaja pakai
-            # tengah-BAWAH kotak (bottom-center: cx = tengah horizontal,
-            # cy = y2/sisi bawah), BUKAN titik tengah geometris kotak
-            # (dulu (y1+y2)/2). Kamera CCTV di sini mengambil gambar dari
-            # sudut miring/tinggi (bukan tegak lurus dari atas), jadi posisi
-            # sebenarnya sebuah kendaraan di jalan diwakili oleh titik roda
-            # menyentuh aspal (dekat sisi bawah kotak) -- bukan titik tengah
-            # kotaknya. Untuk kendaraan tinggi (bus/truk) atau kotak yang
-            # memanjang ke atas (mis. mencakup kepala pengendara motor),
-            # titik tengah kotak bisa "kepeleset" masuk ke garis zona
-            # padahal posisi kendaraan yang sebenarnya (di jalan) masih di
-            # luar garis itu -- inilah penyebab kendaraan yang terlihat di
-            # luar area pantauan tetap ikut ter-tally.
-            zone_dets = []
-            for track_id, class_name, box in frame_boxes:
-                x1, y1, x2, y2 = box
-                cx, cy = (x1 + x2) / 2, y2
-                zone_dets.append((track_id, class_name, cx, cy))
-            new_events = zone_tracker.update(frame_idx, zone_dets)
-            safety_events_out.extend(new_events)
+                # Tandai "person" yang box-nya tumpang tindih signifikan dengan
+                # kendaraan sebagai pengendara/penumpang, bukan pejalan kaki.
+                vehicle_boxes = [b for _, cn, b in frame_boxes if cn in RIDER_HOST_CLASSES]
+                if vehicle_boxes:
+                    for tid, cn, box in frame_boxes:
+                        if cn != "person" or tid in rider_track_ids:
+                            continue
+                        if any(_is_riding(box, vbox) for vbox in vehicle_boxes):
+                            rider_track_ids.add(tid)
 
-        all_frame_detections.append(frame_boxes)
-        frame_idx += 1
+                # Catat "suara" kelas & posisi tiap track untuk keperluan
+                # voting mayoritas & hitungan zona (lihat ZoneTracker.update).
+                #
+                # PENTING: titik yang diuji terhadap poligon zona sengaja pakai
+                # tengah-BAWAH kotak (bottom-center: cx = tengah horizontal,
+                # cy = y2/sisi bawah), BUKAN titik tengah geometris kotak
+                # (dulu (y1+y2)/2). Kamera CCTV di sini mengambil gambar dari
+                # sudut miring/tinggi (bukan tegak lurus dari atas), jadi posisi
+                # sebenarnya sebuah kendaraan di jalan diwakili oleh titik roda
+                # menyentuh aspal (dekat sisi bawah kotak) -- bukan titik tengah
+                # kotaknya. Untuk kendaraan tinggi (bus/truk) atau kotak yang
+                # memanjang ke atas (mis. mencakup kepala pengendara motor),
+                # titik tengah kotak bisa "kepeleset" masuk ke garis zona
+                # padahal posisi kendaraan yang sebenarnya (di jalan) masih di
+                # luar garis itu -- inilah penyebab kendaraan yang terlihat di
+                # luar area pantauan tetap ikut ter-tally.
+                zone_dets = []
+                for track_id, class_name, box in frame_boxes:
+                    x1, y1, x2, y2 = box
+                    cx, cy = (x1 + x2) / 2, y2
+                    zone_dets.append((track_id, class_name, cx, cy))
+                new_events = zone_tracker.update(frame_idx, zone_dets)
+                safety_events_out.extend(new_events)
 
-        # Tahap 1 dianggap porsi 0-70% dari progress total (paling berat,
-        # karena inferensi YOLO ada di sini). Tahap 2 (gambar & tulis video)
-        # jauh lebih ringan (tanpa inferensi model), diberi porsi 70-99%.
-        if progress_interval and frame_idx % progress_interval == 0:
-            pct = min(69, int(frame_idx / total_frames * 70)) if total_frames > 0 else 0
-            if pct != last_progress_sent:
-                _send_progress(req, pct)
-                last_progress_sent = pct
+            all_frame_detections.append(frame_boxes)
+            frame_idx += 1
+
+            # Tahap 1 dianggap porsi 0-70% dari progress total (paling berat,
+            # karena inferensi YOLO ada di sini). Tahap 2 (gambar & tulis video)
+            # jauh lebih ringan (tanpa inferensi model), diberi porsi 70-99%.
+            if progress_interval and frame_idx % progress_interval == 0:
+                pct = min(69, int(frame_idx / total_frames * 70)) if total_frames > 0 else 0
+                if pct != last_progress_sent:
+                    _send_progress(req, pct)
+                    last_progress_sent = pct
 
     total_frames_actual = len(all_frame_detections)
 
@@ -771,7 +813,66 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
     # asli sumbernya untuk akurasi durasi), aman & lebih baik untuk selalu
     # pakai angka frame rate output yang wajar & konsisten, terlepas dari
     # apa pun yang dilaporkan stream-nya.
-    fps = 15.0
+    #
+    # PENTING (fix lanjutan video masih terlihat "loncat-loncat"/tidak
+    # rata setelah fix model_live/imgsz sebelumnya): angka ini SEBELUMNYA
+    # dipatok tetap ke 15.0 -- tebakan yang belum tentu cocok dengan
+    # kecepatan inferensi ASLI di CPU yang menjalankannya (bisa beda-beda
+    # tergantung beban host, jumlah sesi live yang kebetulan berjalan
+    # bersamaan, dll -- lihat _model_live_lock di atas). Kalau target
+    # dipatok jauh di atas kecepatan nyata, tiap frame unik harus
+    # diduplikasi banyak untuk mengejar (lihat pacing writer.write() di
+    # bawah), dan karena waktu inferensi per frame TIDAK konstan (tergantung
+    # jumlah objek di frame, beban CPU sesaat, dll), RASIO duplikasi itu
+    # ikut naik-turun sepanjang sesi -- rasio yang naik-turun inilah yang
+    # tampil sebagai gerakan tersentak/loncat di video, bukan sekadar
+    # gerakan lambat yang konsisten (yang sebenarnya masih terasa cukup
+    # mulus walau kurang detail). Perbaikannya: ukur dulu kecepatan
+    # inferensi model_live yang SEBENARNYA di beberapa frame nyata dari
+    # stream ini sebelum sesi mulai, lalu pakai angka itu (dibatasi ke
+    # rentang wajar) sebagai fps target -- supaya rasio duplikasi mendekati
+    # KONSISTEN sepanjang sesi alih-alih mengejar target yang tidak
+    # realistis.
+    MIN_LIVE_FPS, MAX_LIVE_FPS = 4.0, 15.0
+    CALIBRATION_FRAMES = 5
+    last_seen_seq = 0
+    calib_latencies: list = []
+    calib_deadline = time.monotonic() + 10.0  # jangan sampai kalibrasi menahan mulainya sesi lebih dari 10 detik
+    while len(calib_latencies) < CALIBRATION_FRAMES and time.monotonic() < calib_deadline:
+        calib_frame, calib_seq = reader.latest(last_seen_seq)
+        if calib_frame is None:
+            time.sleep(0.05)
+            continue
+        last_seen_seq = calib_seq
+        t0 = time.monotonic()
+        with _model_live_lock:
+            model_live.track(
+                source=calib_frame,
+                classes=wanted_ids,
+                conf=CONF_THRESHOLD,
+                imgsz=LIVE_IMGSZ,
+                tracker="bytetrack.yaml",
+                persist=True,
+                verbose=False,
+            )
+        calib_latencies.append(time.monotonic() - t0)
+
+    if calib_latencies:
+        avg_latency = sum(calib_latencies) / len(calib_latencies)
+        fps = max(MIN_LIVE_FPS, min(MAX_LIVE_FPS, 1.0 / avg_latency)) if avg_latency > 0 else MAX_LIVE_FPS
+        print(
+            f"[live:{req.job_id}] Kalibrasi kecepatan inferensi: "
+            f"{avg_latency * 1000:.0f}ms/frame rata-rata dari {len(calib_latencies)} frame "
+            f"-> fps target {fps:.1f}",
+            flush=True,
+        )
+    else:
+        # Stream belum sempat memberi satu frame pun untuk dikalibrasi dalam
+        # 10 detik -- pakai batas atas sebagai fallback aman (perilaku lama);
+        # mekanisme reconnect di loop utama di bawah yang akan menangani
+        # kalau stream ini memang bermasalah sejak awal.
+        fps = MAX_LIVE_FPS
+        print(f"[live:{req.job_id}] Kalibrasi gagal (tidak ada frame dalam 10 detik), fallback fps={fps}", flush=True)
 
     zones = []
     for z in req.zones:
@@ -807,7 +908,10 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
     # totalnya yang pas).
     output_frames_written = 0
 
-    last_seen_seq = 0
+    # PENTING: last_seen_seq TIDAK di-reset ke 0 di sini -- sudah diinisialisasi
+    # & dimajukan sebelumnya selama tahap kalibrasi fps di atas. Me-reset ke 0
+    # lagi di sini akan membuat frame yang sudah "dipakai" untuk kalibrasi
+    # berpotensi terhitung/diproses ulang sebagai frame pertama sesi.
     last_new_frame_at = started_at
     reconnect_deadline = None  # None = belum dalam mode "sedang mencoba sambung ulang"
     # Berapa lama TIDAK ADA frame baru sama sekali (dari _LiveStreamReader)
@@ -881,15 +985,25 @@ def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
             # dengan konsekuensi akurasi deteksi objek kecil/jauh sedikit
             # lebih rendah -- trade-off yang bisa disetel lewat env var
             # LIVE_MODEL_NAME/LIVE_IMGSZ tanpa perlu ubah kode ini.
-            results = model_live.track(
-                source=frame,
-                classes=wanted_ids,
-                conf=CONF_THRESHOLD,
-                imgsz=LIVE_IMGSZ,
-                tracker="bytetrack.yaml",
-                persist=True,
-                verbose=False,
-            )
+            #
+            # PENTING: dibungkus _model_live_lock -- lihat penjelasan lengkap
+            # di dekat deklarasinya (dekat `model_live = YOLO(...)` di atas)
+            # kenapa berbagi satu objek model_live antar-thread (mis. 2
+            # lokasi JPL yang jadwal live-nya tumpang tindih) tanpa lock bisa
+            # membuat state tracker ByteTrack tercampur antar sesi -- box &
+            # track ID "meloncat" tidak wajar, gejalanya sangat mirip dengan
+            # video yang cuma kurang fps, tapi akar masalahnya beda sama
+            # sekali (korupsi state, bukan keterlambatan inferensi).
+            with _model_live_lock:
+                results = model_live.track(
+                    source=frame,
+                    classes=wanted_ids,
+                    conf=CONF_THRESHOLD,
+                    imgsz=LIVE_IMGSZ,
+                    tracker="bytetrack.yaml",
+                    persist=True,
+                    verbose=False,
+                )
             result = results[0]
 
             frame_boxes = []
