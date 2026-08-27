@@ -2,27 +2,53 @@ import os
 
 MODEL_NAME = os.getenv("MODEL_NAME", "yolov8s.pt")
 CALLBACK_SECRET = os.getenv("CALLBACK_SECRET", "change-me-secret")
-CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.35"))
+
+# PENTING (redesign 27 Agu 2026, lihat docstring _record_raw_stream &
+# _run_live_detection di main.py): SEBELUMNYA nilai default ini 0.35, dan
+# dipakai LANGSUNG sebagai filter `conf=` pada pemanggilan model.track() --
+# artinya deteksi dengan confidence di bawah 0.35 dibuang TOTAL sebelum
+# sempat sampai ke tracker ByteTrack sama sekali.
+#
+# Ini bertentangan dengan cara kerja ByteTrack sendiri: algoritma ini SENGAJA
+# dirancang dua tahap -- deteksi confidence TINGGI (>= track_high_thresh)
+# dipakai untuk asosiasi utama, deteksi confidence RENDAH (di antara
+# track_low_thresh & track_high_thresh, lihat bytetrack_sigap.yaml) tetap
+# dipakai untuk MELANJUTKAN track yang sudah ada (mis. motor yang sesaat
+# konfiden modelnya turun karena oklusi sebagian/sudut kamera), TAPI tidak
+# pernah dipakai untuk memulai track BARU (itu hak track_high_thresh/
+# new_track_thresh saja). Kalau conf global sudah membuang semua deteksi di
+# bawah 0.35 sebelum tracker sempat melihatnya, separuh mekanisme ByteTrack
+# ini otomatis mati -- track yang objeknya sempat sedikit tertutup akan
+# HILANG (bukan dilanjutkan), lalu saat objeknya terlihat jelas lagi
+# beberapa frame kemudian, ByteTrack menganggapnya track BARU dengan ID
+# baru. Akibatnya: kendaraan yang sama bisa ter-tally lebih dari sekali
+# (dobel hitung) ATAU malah tidak ter-tally sama sekali (kalau ID barunya
+# muncul saat sudah lewat dari poligon zona) -- ini kemungkinan besar
+# kontributor utama laporan "jumlah kendaraan masih terlalu sedikit",
+# terpisah dari (dan bisa terjadi bersamaan dengan) soal pilihan model.
+#
+# Perbaikan: turunkan filter conf GLOBAL ini mendekati track_low_thresh di
+# bytetrack_sigap.yaml (0.1), supaya deteksi confidence rendah tetap sampai
+# ke tracker untuk keperluan KELANJUTAN track -- track BARU tetap tidak
+# akan pernah dibuat dari deteksi selemah itu (dijaga oleh new_track_thresh
+# di tracker, bukan oleh nilai ini), jadi ini TIDAK menambah false-positive
+# baru ke hitungan, hanya mengurangi track yang hilang akibat oklusi
+# sesaat.
+CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.1"))
+
 DEFAULT_DANGER_DWELL_SECONDS = float(os.getenv("DANGER_DWELL_SECONDS", "5"))
 TRAIL_LENGTH = int(os.getenv("TRAIL_LENGTH", "30"))  # jumlah titik jejak lintasan yang disimpan per objek
 
-# Model & ukuran input KHUSUS untuk sesi live (lihat _run_live_detection).
-# VPS ini CPU-only 4 vCPU -- inferensi yolov8s pada imgsz default (~640)
-# jauh lebih lambat daripada target output 15fps (video hasil live diproses
-# dalam SATU pass real-time, beda dengan mode unggah file yang tidak
-# terburu waktu), jadi frame yang sama harus diduplikasi berkali-kali untuk
-# mengejar durasi -- inilah penyebab video hasil sesi live terlihat
-# patah-patah/"steppy" walau durasinya sudah benar (lihat komentar pacing
-# di _run_live_detection). Memakai model & imgsz yang lebih ringan KHUSUS
-# untuk live (mode unggah file tetap pakai MODEL_NAME/yolov8s penuh karena
-# tidak ada tekanan real-time) mengurangi waktu inferensi per frame supaya
-# lebih banyak frame UNIK yang sempat diproses per detik -- konsekuensinya
-# akurasi deteksi objek kecil/jauh pada live sedikit lebih rendah daripada
-# mode unggah file. Kedua nilai ini sengaja dibuat bisa diubah lewat env
-# var (tanpa perlu ubah kode) supaya trade-off kecepatan vs akurasi ini
-# bisa disetel ulang sesuai kebutuhan/hasil pengamatan lapangan.
-LIVE_MODEL_NAME = os.getenv("LIVE_MODEL_NAME", "yolov8n.pt")
-LIVE_IMGSZ = int(os.getenv("LIVE_IMGSZ", "480"))
+# Ukuran input (imgsz) inferensi YOLO -- DIPAKAI BERSAMA oleh mode unggah
+# file MAUPUN sesi live sejak redesign 27 Agu 2026 (lihat docstring
+# _run_live_detection soal kenapa sesi live sekarang tidak lagi punya
+# tekanan real-time, jadi tidak lagi butuh model/imgsz terpisah yang lebih
+# ringan seperti LIVE_MODEL_NAME/LIVE_IMGSZ versi sebelumnya -- keduanya
+# sudah dipensiunkan). Dibuat lewat env var (bukan konstanta di kode)
+# supaya bisa dinaikkan (mis. ke 960) untuk kendaraan kecil/jauh di CCTV
+# tanpa build ulang image, kalau hasil lapangan menunjukkan itu masih
+# kurang -- trade-off-nya waktu proses lebih lama per video/sesi.
+DETECT_IMGSZ = int(os.getenv("DETECT_IMGSZ", "640"))
 
 # Mapping id kelas COCO -> nama kelas yang dihitung aplikasi ini.
 # 0=person, 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck

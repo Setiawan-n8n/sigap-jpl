@@ -1,0 +1,44 @@
+# Konfigurasi ByteTrack HASIL TUNING untuk SIGAP-JPL (27 Agu 2026), dipakai
+# menggantikan "bytetrack.yaml" bawaan ultralytics -- lihat penjelasan
+# lengkap alasannya di komentar CONF_THRESHOLD (config.py) & docstring
+# _detect_and_render (main.py). Ringkasan alasan tiap perubahan dari nilai
+# bawaan ultralytics (dikomentari di sebelah masing-masing):
+#
+# Dipakai untuk lalu lintas CCTV padat (motor bercampur mobil/truk, sering
+# saling menutupi/oklusi sesaat dari sudut kamera JPL) -- tujuannya
+# mengurangi track yang HILANG lalu muncul lagi dengan ID baru saat objek
+# sempat tertutup objek lain, karena itu penyebab utama kendaraan yang
+# sama ter-tally dobel atau malah tidak ter-tally sama sekali.
+
+tracker_type: bytetrack
+
+# Ambang confidence untuk asosiasi tahap PERTAMA (deteksi "yakin").
+track_high_thresh: 0.5
+
+# Ambang confidence MINIMUM yang masih dipakai tracker untuk asosiasi tahap
+# KEDUA (melanjutkan track yang sudah ada, bukan bikin track baru) -- HARUS
+# selaras dengan CONF_THRESHOLD di config.py (0.1): kalau CONF_THRESHOLD
+# lebih tinggi dari ini, deteksi confidence rendah yang dibutuhkan tahap
+# kedua ini sudah kebuang duluan sebelum sempat sampai ke tracker sama
+# sekali, membuat setelan ini tidak berguna.
+track_low_thresh: 0.1
+
+# Ambang confidence untuk MEMULAI track baru -- SENGAJA tetap dijaga cukup
+# tinggi (bawaan ultralytics: 0.6, di sini sedikit diturunkan ke 0.5)
+# supaya deteksi confidence rendah dari track_low_thresh di atas TIDAK bisa
+# memicu track baru (mencegah dobel-hitung/false positive) -- confidence
+# rendah hanya boleh MELANJUTKAN track yang sudah pernah dikonfirmasi
+# dengan confidence tinggi sebelumnya.
+new_track_thresh: 0.5
+
+# Jumlah frame maksimum sebuah track "ditahan" (masih dianggap objek yang
+# sama) walau sedang tidak ada deteksi yang cocok untuknya sama sekali --
+# dinaikkan dari bawaan 30 menjadi 60 supaya objek yang tertutup kendaraan
+# lain lebih lama (mis. motor di belakang truk saat truk melintas) masih
+# bisa "diingat" tracker sampai terlihat lagi, alih-alih dianggap hilang
+# lalu muncul sebagai track/ID baru saat oklusinya lewat dari ~1 detik
+# (pada ~30fps) menjadi ~2 detik.
+track_buffer: 60
+
+match_thresh: 0.8
+fuse_score: true
