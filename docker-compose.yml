@@ -52,18 +52,15 @@ services:
       CALLBACK_SECRET: "${DETECTOR_CALLBACK_SECRET:-change-me-secret}"
       MODEL_NAME: "${MODEL_NAME:-yolov8s.pt}"
       DANGER_DWELL_SECONDS: "${DANGER_DWELL_SECONDS:-5}"
-      # Model & ukuran input KHUSUS sesi live (lihat config.py &
-      # _run_live_detection di detector-service/app/main.py) -- SEBELUMNYA
-      # tidak ada di sini sama sekali, jadi hanya bisa disetel dengan
-      # mengubah kode + build ulang image. Diteruskan lewat env di sini
-      # supaya trade-off kecepatan vs akurasi tayangan live bisa disetel
-      # ulang (mis. LIVE_IMGSZ diperkecil kalau CPU host masih kewalahan)
-      # cukup lewat variabel lingkungan/`.env` + restart container, TANPA
-      # perlu build ulang -- asalkan model yang dirujuk LIVE_MODEL_NAME
-      # sudah diunduh saat build (lihat detector-service/Dockerfile; saat
-      # ini hanya yolov8n.pt & yolov8s.pt yang ikut dibundel).
-      LIVE_MODEL_NAME: "${LIVE_MODEL_NAME:-yolov8n.pt}"
-      LIVE_IMGSZ: "${LIVE_IMGSZ:-480}"
+      # Redesign 27 Agu 2026 (lihat detector-service/app/main.py &
+      # config.py): sesi live sekarang direkam dulu lalu diproses lewat
+      # pipeline yang sama dengan mode unggah file -- LIVE_MODEL_NAME &
+      # LIVE_IMGSZ (model/ukuran-input ringan khusus live) sudah tidak
+      # dipakai lagi & dipensiunkan dari sini. Dua env var di bawah
+      # menggantikan peran "trade-off kecepatan vs akurasi yang bisa
+      # disetel tanpa build ulang" untuk KEDUA mode sekaligus:
+      CONF_THRESHOLD: "${CONF_THRESHOLD:-0.1}"
+      DETECT_IMGSZ: "${DETECT_IMGSZ:-640}"
 
 volumes:
   videos_data:
