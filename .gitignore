@@ -16,6 +16,7 @@ laravel-app/storage/framework/views/*
 laravel-app/storage/logs/*
 laravel-app/storage/app/videos/*
 laravel-app/database/database.sqlite
+laravel-app/database/data/
 laravel-app/bootstrap/cache/*.php
 !laravel-app/storage/framework/cache/.gitignore
 !laravel-app/storage/framework/sessions/.gitignore

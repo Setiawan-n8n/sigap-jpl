@@ -16,6 +16,12 @@
         <div class="bg-white rounded-xl shadow p-6">
             <h2 class="text-lg font-semibold mb-4">Masuk</h2>
 
+            @if (session('status'))
+                <div class="mb-4 rounded-lg bg-green-100 text-green-800 px-4 py-3 text-sm">
+                    {{ session('status') }}
+                </div>
+            @endif
+
             @if ($errors->any())
                 <div class="mb-4 rounded-lg bg-red-100 text-red-800 px-4 py-3 text-sm">
                     <ul class="list-disc list-inside">
@@ -34,7 +40,10 @@
                            class="w-full text-sm border rounded-lg p-2">
                 </div>
                 <div>
-                    <label class="block text-sm font-medium mb-1">Password</label>
+                    <div class="flex items-center justify-between mb-1">
+                        <label class="block text-sm font-medium">Password</label>
+                        <a href="{{ route('password.request') }}" class="text-xs text-slate-500 hover:text-slate-900 underline">Lupa password?</a>
+                    </div>
                     <input type="password" name="password" required
                            class="w-full text-sm border rounded-lg p-2">
                 </div>

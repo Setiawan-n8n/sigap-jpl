@@ -9,7 +9,13 @@ return [
         'sqlite' => [
             'driver' => 'sqlite',
             'url' => env('DB_URL'),
-            'database' => env('DB_DATABASE', database_path('database.sqlite')),
+            // Path file SQLite ditentukan lewat database_path() (mengikuti
+            // base_path aplikasi), sehingga otomatis benar baik di lokal
+            // (D:\...\laravel-app\database\data\database.sqlite) maupun di
+            // container (/var/www/html/database/data/database.sqlite). Sengaja
+            // TIDAK membaca env DB_DATABASE agar tidak perlu menyetel path
+            // absolut yang berbeda antar OS.
+            'database' => database_path('data/database.sqlite'),
             'prefix' => '',
             'foreign_key_constraints' => env('DB_FOREIGN_KEYS', true),
             // PENTING: aplikasi ini punya 2 container (app + queue) yang menulis

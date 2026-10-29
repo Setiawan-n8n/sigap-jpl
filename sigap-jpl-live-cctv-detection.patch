@@ -1,0 +1,1886 @@
+From 79dd170ca0ad94b2ccbba77a22c564bf5d8d00b3 Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.com>
+Date: Wed, 19 Aug 2026 07:08:36 +0000
+Subject: [PATCH] feat: deteksi live CCTV terjadwal (real-time, tanpa rekam ke
+ file dulu)
+
+Administrator kini bisa menjadwalkan rentang waktu mulai/selesai di masa
+depan untuk memproses stream CCTV sebuah lokasi JPL secara LANGSUNG lewat
+YOLOv8 + ByteTrack (pipeline yang sama dengan unggah video manual), tanpa
+merekam ke file terlebih dahulu. Zona (arah/bahaya) digambar ulang di atas
+snapshot terkini yang diambil otomatis dari stream saat penjadwalan dibuat.
+
+- detector-service: endpoint baru /snapshot (ambil 1 frame via ffmpeg) dan
+  /process-live (deteksi+tracking single-pass real-time selama rentang
+  waktu terjadwal, berhenti sendiri saat waktu selesai tercapai, hasil
+  dikirim lewat callback HTTP yang sama dengan mode unggah file).
+- Laravel: tabel live_capture_jobs (jadwal), StartDueLiveCaptureJobs
+  (Artisan command yang dijalankan tiap menit lewat Laravel Task
+  Scheduling untuk memulai jadwal yang waktunya tiba), ProcessLiveCaptureJob,
+  LiveCaptureJobController (snapshot/store/cancel), dan DetectorClient
+  diperluas untuk memicu /process-live. Hasil deteksi live disimpan sebagai
+  Video biasa sehingga otomatis memakai infrastruktur status-polling &
+  halaman detail yang sudah ada.
+- Scheduler dijalankan berdampingan dengan queue worker di container yang
+  sama (php artisan schedule:work di background) -- tidak perlu container
+  atau proses cron baru.
+- UI: panel "Video Hasil Deteksi & Tracking" di Dashboard Online (di
+  sebelah Tayangan CCTV), diekstrak jadi partial videos/_result_panel yang
+  dipakai bersama oleh halaman detail video. Panel penjadwalan (ambil
+  snapshot + gambar zona + pilih rentang waktu) di halaman Lokasi JPL.
+
+Catatan: karena stream live tidak bisa dibaca ulang/di-seek, deteksi
+memakai satu pass (bukan dua pass seperti mode unggah file) -- label kelas
+sebuah track memakai voting mayoritas sejauh ini, bisa saja masih berubah
+sesaat sebelum stabil di detik-detik awal kemunculannya. Sandbox tidak bisa
+menjalankan composer install/Docker untuk uji coba langsung -- divalidasi
+lewat php -l di semua file PHP, py_compile di semua file Python,
+cross-reference route() di semua Blade view, dan pengecekan keseimbangan
+direktif Blade (@if/@endif dkk).
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WoDU8W33St5RHkXCDdfuKW
+---
+ README.md                                     |  18 +
+ detector-service/app/main.py                  | 291 +++++++++++++++
+ .../Commands/StartDueLiveCaptureJobs.php      |  89 +++++
+ .../Http/Controllers/DashboardController.php  |  19 +
+ .../Controllers/JplLocationController.php     |  20 +-
+ .../Controllers/LiveCaptureJobController.php  | 110 ++++++
+ .../app/Jobs/ProcessLiveCaptureJob.php        |  49 +++
+ laravel-app/app/Models/JplLocation.php        |   5 +
+ laravel-app/app/Models/LiveCaptureJob.php     |  53 +++
+ laravel-app/app/Models/Video.php              |  15 +
+ laravel-app/app/Services/DetectorClient.php   |  54 +++
+ ..._000002_create_live_capture_jobs_table.php |  39 ++
+ laravel-app/docker/entrypoint.sh              |  10 +
+ .../views/dashboard/online.blade.php          |  40 +-
+ .../resources/views/locations/index.blade.php | 350 +++++++++++++++++-
+ .../views/videos/_result_panel.blade.php      | 182 +++++++++
+ .../resources/views/videos/show.blade.php     | 179 +--------
+ laravel-app/routes/console.php                |   6 +
+ laravel-app/routes/web.php                    |  10 +
+ 19 files changed, 1354 insertions(+), 185 deletions(-)
+ create mode 100644 laravel-app/app/Console/Commands/StartDueLiveCaptureJobs.php
+ create mode 100644 laravel-app/app/Http/Controllers/LiveCaptureJobController.php
+ create mode 100644 laravel-app/app/Jobs/ProcessLiveCaptureJob.php
+ create mode 100644 laravel-app/app/Models/LiveCaptureJob.php
+ create mode 100644 laravel-app/database/migrations/2026_08_19_000002_create_live_capture_jobs_table.php
+ create mode 100644 laravel-app/resources/views/videos/_result_panel.blade.php
+
+diff --git a/README.md b/README.md
+index 75e70dc..62d1e3a 100644
+--- a/README.md
++++ b/README.md
+@@ -25,6 +25,14 @@ on-site dekat JPL, tanpa internet setelah image dibangun) maupun **online**
+   event, filter berdasarkan lokasi & rentang tanggal, dan **export CSV**.
+ - **Dashboard Online** — tayangan CCTV langsung per lokasi JPL, aktif begitu
+   Administrator mengisi URL CCTV (HLS/MP4/embed) lewat menu Lokasi JPL.
++- **Deteksi live terjadwal** — Administrator bisa menjadwalkan rentang waktu
++  mulai/selesai (maks. 6 jam) untuk memproses stream CCTV sebuah lokasi
++  **secara langsung lewat YOLOv8**, tanpa merekam ke file dulu. Zona
++  digambar ulang di atas snapshot terkini yang diambil otomatis dari stream
++  saat penjadwalan dibuat. Hasilnya (video hasil deteksi & tracking, total per
++  kategori, rincian per zona, safety event) tampil di panel "Video Hasil
++  Deteksi & Tracking" pada Dashboard Online, di sebelah tayangan CCTV live.
++  Lihat bagian "Cara pakai" poin 9 di bawah.
+ - **Login & role pengguna** — seluruh halaman (kecuali endpoint callback dari
+   detector-service) dilindungi otentikasi. Dua role: **Administrator** (akses
+   penuh: Unggah Video, Lokasi JPL, Kelola Pengguna) dan **User** (hanya bisa
+@@ -141,6 +149,16 @@ admin terakhir tidak bisa dinonaktifkan/dihapus lewat menu Kelola Pengguna.
+ 8. Bagikan akun dengan role **user** (dibuat lewat menu Kelola Pengguna)
+    kepada anggota tim yang hanya perlu memantau **Dashboard** — mereka tidak
+    melihat menu Unggah Video/Lokasi JPL/Kelola Pengguna sama sekali.
++9. Untuk menjadwalkan **deteksi live**: di **/locations**, pada lokasi yang
++   sudah punya URL CCTV, klik **"+ Jadwalkan Deteksi Live"**. Isi waktu
++   mulai & selesai (di masa depan, maks. 6 jam), klik **"Ambil Snapshot dari
++   CCTV"** untuk mengambil gambar terkini dari stream, lalu gambar zona di
++   atasnya (sama seperti langkah 4) dan klik **Simpan Jadwal**. Saat waktu
++   mulai tiba, sistem otomatis memproses stream CCTV lokasi tersebut secara
++   langsung lewat YOLOv8 (tanpa merekam ke file dulu) sampai waktu selesai.
++   Hasilnya muncul di panel "Video Hasil Deteksi & Tracking" pada Dashboard
++   Online untuk lokasi tersebut, diperbarui otomatis seperti halaman detail
++   video biasa.
+ 
+ ## Deploy ke VPS via Coolify
+ 
+diff --git a/detector-service/app/main.py b/detector-service/app/main.py
+index e4f589c..9426d56 100644
+--- a/detector-service/app/main.py
++++ b/detector-service/app/main.py
+@@ -2,7 +2,9 @@ import os
+ import re
+ import subprocess
+ import threading
++import time
+ import traceback
++import uuid
+ from collections import defaultdict, deque
+ from datetime import datetime, timedelta
+ from typing import List, Optional
+@@ -62,6 +64,24 @@ class ProcessRequest(BaseModel):
+     callback_secret: Optional[str] = None
+ 
+ 
++class SnapshotRequest(BaseModel):
++    url: str
++
++
++class ProcessLiveRequest(BaseModel):
++    job_id: int
++    stream_url: str
++    location_name: str = "JPL"
++    start_at: Optional[str] = None
++    finish_at: str
++    zones: List[ZoneSchema]
++    classes: List[str] = ["person", "bicycle", "car", "motorcycle", "bus", "truck"]
++    danger_dwell_seconds: float = DEFAULT_DANGER_DWELL_SECONDS
++    callback_url: str
++    progress_url: Optional[str] = None
++    callback_secret: Optional[str] = None
++
++
+ @app.get("/health")
+ def health():
+     return {"status": "ok", "model": MODEL_NAME}
+@@ -83,6 +103,73 @@ def process(req: ProcessRequest):
+     return {"accepted": True, "job_id": req.job_id}
+ 
+ 
++@app.post("/snapshot")
++def snapshot(req: SnapshotRequest):
++    """Ambil satu frame dari stream CCTV (dipanggil admin saat menjadwalkan
++    deteksi live, supaya admin bisa menggambar ulang zona di atas kondisi
++    kamera terkini -- lihat _capture_snapshot)."""
++    try:
++        rel_path, width, height = _capture_snapshot(req.url)
++    except Exception as exc:  # noqa: BLE001
++        traceback.print_exc()
++        raise HTTPException(status_code=422, detail=f"Gagal mengambil snapshot: {exc}")
++
++    return {"path": rel_path, "width": width, "height": height}
++
++
++@app.post("/process-live")
++def process_live(req: ProcessLiveRequest):
++    """Proses stream CCTV secara LANGSUNG (real-time) lewat YOLOv8 + ByteTrack,
++    tanpa merekam ke file terlebih dahulu -- lihat _run_live_detection."""
++    if not req.zones:
++        raise HTTPException(status_code=422, detail="Minimal satu zona diperlukan.")
++
++    try:
++        finish_at = datetime.fromisoformat(req.finish_at)
++    except ValueError:
++        raise HTTPException(status_code=422, detail="Format finish_at tidak valid.")
++
++    if finish_at <= datetime.now():
++        raise HTTPException(status_code=422, detail="finish_at sudah lewat.")
++
++    thread = threading.Thread(target=_process_live_video, args=(req, finish_at), daemon=True)
++    thread.start()
++
++    return {"accepted": True, "job_id": req.job_id}
++
++
++def _capture_snapshot(url: str):
++    """Ambil satu frame dari URL stream (HLS/MP4/RTSP) memakai ffmpeg dan
++    simpan sebagai JPEG di volume bersama /data/videos/live-snapshots, supaya
++    bisa dibaca balik oleh container Laravel (storage/app/videos) lewat
++    volume Docker yang sama. Mengembalikan (path_relatif, width, height)."""
++    snapshots_dir = "/data/videos/live-snapshots"
++    os.makedirs(snapshots_dir, exist_ok=True)
++
++    filename = f"{uuid.uuid4().hex}.jpg"
++    out_path = os.path.join(snapshots_dir, filename)
++
++    subprocess.run(
++        [
++            "ffmpeg", "-y", "-loglevel", "error",
++            "-rtsp_transport", "tcp",
++            "-i", url,
++            "-frames:v", "1", "-q:v", "2",
++            out_path,
++        ],
++        check=True,
++        timeout=25,
++    )
++
++    frame = cv2.imread(out_path)
++    if frame is None:
++        raise RuntimeError("File snapshot tidak terbaca (stream mungkin tidak valid).")
++
++    height, width = frame.shape[:2]
++
++    return f"live-snapshots/{filename}", width, height
++
++
+ def _process_video(req: ProcessRequest):
+     try:
+         counts, annotated_relpath, safety_events = _run_detection(req)
+@@ -100,6 +187,23 @@ def _process_video(req: ProcessRequest):
+         })
+ 
+ 
++def _process_live_video(req: ProcessLiveRequest, finish_at: datetime):
++    try:
++        counts, annotated_relpath, safety_events = _run_live_detection(req, finish_at)
++        _send_callback(req, {
++            "status": "completed",
++            "annotated_path": annotated_relpath,
++            "counts": counts,
++            "safety_events": safety_events,
++        })
++    except Exception as exc:  # noqa: BLE001
++        traceback.print_exc()
++        _send_callback(req, {
++            "status": "failed",
++            "error_message": str(exc),
++        })
++
++
+ def _sanitize(name: str) -> str:
+     return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower() or "zona"
+ 
+@@ -343,6 +447,193 @@ def _run_detection(req: ProcessRequest):
+     return zone_tracker.direction_rows(), f"results/{output_filename}", safety_events_out
+ 
+ 
++def _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):
++    """Proses stream CCTV LANGSUNG lewat YOLOv8 + ByteTrack selama rentang
++    waktu terjadwal, tanpa merekam ke file dulu (beda dengan _run_detection
++    yang bekerja dua tahap atas file lokal yang bisa dibaca ulang).
++
++    Karena sumbernya stream live yang TIDAK bisa dibaca ulang/di-seek, di
++    sini deteksi & penggambaran dilakukan dalam SATU pass: setiap frame
++    langsung digambar begitu diproses, memakai kelas "mayoritas sejauh ini"
++    untuk track tsb (ZoneTracker._majority_class, sama seperti mode
++    unggah file, hanya saja votingnya baru final di akhir stream, bukan di
++    akhir seluruh video sejak awal). Konsekuensinya: label sebuah track di
++    detik-detik awal kemunculannya bisa saja masih berubah sesaat sebelum
++    stabil -- ini trade-off yang tidak terhindarkan untuk pemrosesan
++    real-time (tidak seperti file, di sini "masa depan" video belum ada saat
++    frame sekarang digambar).
++    """
++    base_dir = os.path.join("/data/videos", "live", str(req.job_id))
++    results_dir = os.path.join(base_dir, "results")
++    snapshots_dir = os.path.join(results_dir, "snapshots")
++    os.makedirs(snapshots_dir, exist_ok=True)
++
++    output_filename = f"{req.job_id}_annotated.mp4"
++    output_path = os.path.join(results_dir, output_filename)
++
++    base_dt = _parse_recorded_at(req.start_at)
++    wanted_ids = [cid for cid, name in TARGET_CLASSES.items() if name in req.classes]
++
++    cap = cv2.VideoCapture(req.stream_url)
++    if not cap.isOpened():
++        raise RuntimeError("Tidak dapat membuka stream CCTV. Periksa kembali URL-nya.")
++
++    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
++    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
++    fps = cap.get(cv2.CAP_PROP_FPS)
++    if not fps or fps <= 1 or fps > 60:
++        # Banyak stream live (HLS/RTSP relay) tidak melaporkan FPS yang
++        # benar lewat CAP_PROP_FPS -- pakai asumsi wajar untuk CCTV supaya
++        # durasi hasil rekaman anotasi tidak melenceng jauh.
++        fps = 15.0
++
++    zones = []
++    for z in req.zones:
++        zones.append(Zone(name=z.name, type=z.type, polygon=build_polygon(z.points, width, height)))
++    zone_colors = {z.name: hex_to_bgr(zs.color) for z, zs in zip(zones, req.zones)}
++
++    zone_tracker = ZoneTracker(zones=zones, fps=fps, danger_dwell_seconds=req.danger_dwell_seconds)
++
++    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
++
++    trails: dict = defaultdict(lambda: deque(maxlen=TRAIL_LENGTH))
++    rider_track_ids: set = set()
++    safety_events_out = []
++
++    started_at = datetime.now()
++    planned_seconds = max(1.0, (finish_at - started_at).total_seconds())
++    last_progress_sent = -1
++    frame_idx = 0
++    consecutive_failures = 0
++    max_consecutive_failures = int(fps * 20)  # ~20 detik tanpa frame -> anggap stream putus
++
++    try:
++        while True:
++            now = datetime.now()
++            if now >= finish_at:
++                break
++
++            ok, frame = cap.read()
++            if not ok or frame is None:
++                consecutive_failures += 1
++                if consecutive_failures >= max_consecutive_failures:
++                    break
++                # Beri jeda singkat lalu coba lagi -- stream live kadang
++                # sesaat tersendat (buffering jaringan), bukan berarti putus.
++                time.sleep(0.2)
++                continue
++            consecutive_failures = 0
++
++            # Deteksi & tracking satu frame. persist=True menjaga ID track
++            # tetap konsisten antar pemanggilan berturut-turut (sama seperti
++            # stream=True pada mode unggah file, tapi di sini dipanggil
++            # manual per-frame karena sumbernya bukan path file).
++            results = model.track(
++                source=frame,
++                classes=wanted_ids,
++                conf=CONF_THRESHOLD,
++                tracker="bytetrack.yaml",
++                persist=True,
++                verbose=False,
++            )
++            result = results[0]
++
++            frame_boxes = []
++            boxes = result.boxes
++            if boxes is not None and boxes.id is not None:
++                xyxy = boxes.xyxy.cpu().numpy()
++                ids = boxes.id.cpu().numpy()
++                cls_ids = boxes.cls.cpu().numpy()
++
++                for box, tid, cls_id in zip(xyxy, ids, cls_ids):
++                    class_name = TARGET_CLASSES.get(int(cls_id))
++                    if class_name is None:
++                        continue
++                    frame_boxes.append((int(tid), class_name, box))
++
++                vehicle_boxes = [b for _, cn, b in frame_boxes if cn in RIDER_HOST_CLASSES]
++                if vehicle_boxes:
++                    for tid, cn, box in frame_boxes:
++                        if cn != "person" or tid in rider_track_ids:
++                            continue
++                        if any(_is_riding(box, vbox) for vbox in vehicle_boxes):
++                            rider_track_ids.add(tid)
++
++                zone_dets = []
++                for track_id, class_name, box in frame_boxes:
++                    x1, y1, x2, y2 = box
++                    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
++                    zone_dets.append((track_id, class_name, cx, cy))
++                new_events = zone_tracker.update(frame_idx, zone_dets)
++                for ev in new_events:
++                    safety_events_out.append(ev)
++
++            overlay = frame.copy()
++            for zone, zs in zip(zones, req.zones):
++                color = zone_colors[zone.name]
++                pts = zone.polygon.astype(int).reshape((-1, 1, 2))
++                if zone.type == "danger":
++                    cv2.fillPoly(overlay, [pts], color)
++                cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=2)
++            frame = cv2.addWeighted(overlay, 0.18, frame, 0.82, 0)
++
++            for track_id, raw_class_name, box in frame_boxes:
++                class_name = zone_tracker._majority_class(track_id, raw_class_name)
++                if class_name == "person" and track_id in rider_track_ids:
++                    continue
++
++                x1, y1, x2, y2 = box
++                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
++
++                trails[track_id].append((int(cx), int(cy)))
++                color = track_color(track_id)
++                pts = list(trails[track_id])
++                for i in range(1, len(pts)):
++                    cv2.line(frame, pts[i - 1], pts[i], color, 2)
++
++                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
++                cv2.putText(
++                    frame, f"{class_name}#{track_id}", (int(x1), max(0, int(y1) - 6)),
++                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1,
++                )
++
++            timestamp = base_dt + timedelta(seconds=(now - started_at).total_seconds())
++            cv2.rectangle(frame, (0, 0), (width, 28), (0, 0, 0), -1)
++            cv2.putText(frame, f"{req.location_name[:50]} (LIVE)", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
++            ts_text = timestamp.strftime("%Y-%m-%d %H:%M:%S")
++            (tw, _), _ = cv2.getTextSize(ts_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
++            cv2.putText(frame, ts_text, (width - tw - 8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
++
++            for ev in [e for e in safety_events_out if e.get("frame_idx") == frame_idx and "snapshot_path" not in e]:
++                ev["class_name"] = zone_tracker._majority_class(ev["track_id"], ev["class_name"])
++                snap_name = f"{req.job_id}_{ev['track_id']}_{_sanitize(ev['zone_name'])}_{frame_idx}.jpg"
++                snap_path = os.path.join(snapshots_dir, snap_name)
++                cv2.imwrite(snap_path, frame)
++                ev["snapshot_path"] = f"live/{req.job_id}/results/snapshots/{snap_name}"
++
++            writer.write(frame)
++            frame_idx += 1
++
++            elapsed = (now - started_at).total_seconds()
++            pct = min(99, int(elapsed / planned_seconds * 100))
++            if pct != last_progress_sent and pct % 2 == 0:
++                _send_progress(req, pct)
++                last_progress_sent = pct
++    finally:
++        cap.release()
++        writer.release()
++
++    if frame_idx == 0:
++        raise RuntimeError("Tidak ada frame yang berhasil dibaca dari stream CCTV selama sesi ini.")
++
++    for ev in safety_events_out:
++        ev.pop("frame_idx", None)
++
++    _transcode_to_h264(output_path)
++
++    return zone_tracker.direction_rows(), f"live/{req.job_id}/results/{output_filename}", safety_events_out
++
++
+ def _transcode_to_h264(path: str) -> None:
+     """Re-encode video ke H.264 (codec "mp4v" hasil cv2.VideoWriter bisa
+     ditulis, tapi TIDAK bisa diputar langsung di browser -- Chrome/Firefox/
+diff --git a/laravel-app/app/Console/Commands/StartDueLiveCaptureJobs.php b/laravel-app/app/Console/Commands/StartDueLiveCaptureJobs.php
+new file mode 100644
+index 0000000..49abf23
+--- /dev/null
++++ b/laravel-app/app/Console/Commands/StartDueLiveCaptureJobs.php
+@@ -0,0 +1,89 @@
++<?php
++
++namespace App\Console\Commands;
++
++use App\Jobs\ProcessLiveCaptureJob;
++use App\Models\LiveCaptureJob;
++use App\Models\Video;
++use Illuminate\Console\Command;
++
++/**
++ * Dijalankan tiap menit lewat Laravel Task Scheduling (lihat routes/console.php
++ * dan php artisan schedule:work di docker/entrypoint.sh). Memulai jadwal
++ * deteksi live yang waktu mulainya sudah tiba: membuat baris `videos` baru
++ * (supaya hasilnya bisa ditampilkan lewat infrastruktur Video yang sudah
++ * ada -- status polling, halaman detail, dsb) lalu memicu pemrosesan stream
++ * CCTV secara langsung lewat ProcessLiveCaptureJob.
++ */
++class StartDueLiveCaptureJobs extends Command
++{
++    protected $signature = 'sigap:start-due-live-jobs';
++
++    protected $description = 'Mulai jadwal deteksi live CCTV yang waktu mulainya sudah tiba, dan tandai gagal jadwal yang terlewat.';
++
++    public function handle(): int
++    {
++        $due = LiveCaptureJob::query()
++            ->where('status', 'scheduled')
++            ->where('start_at', '<=', now())
++            ->where('finish_at', '>', now())
++            ->get();
++
++        foreach ($due as $job) {
++            $location = $job->jplLocation;
++
++            if (! $location || ! $location->cctv_url) {
++                $job->update([
++                    'status' => 'failed',
++                    'error_message' => 'Lokasi JPL atau URL CCTV sudah tidak tersedia saat jadwal dimulai.',
++                ]);
++                $this->warn("Job #{$job->id} dibatalkan: lokasi/CCTV tidak lagi tersedia.");
++
++                continue;
++            }
++
++            $video = Video::create([
++                'jpl_location_id' => $location->id,
++                'original_name' => "Live: {$location->name} ({$job->start_at->format('d M Y H:i')})",
++                'filename' => "live-{$job->id}",
++                'disk' => 'videos',
++                'recorded_at' => $job->start_at,
++                'status' => 'pending',
++            ]);
++
++            foreach ($job->zones as $zone) {
++                $video->zones()->create([
++                    'name' => $zone['name'],
++                    'type' => in_array($zone['type'] ?? 'direction', ['direction', 'danger'], true) ? $zone['type'] : 'direction',
++                    'color' => $zone['color'] ?? '#22c55e',
++                    'points' => $zone['points'],
++                ]);
++            }
++
++            $job->update(['video_id' => $video->id, 'status' => 'running']);
++
++            ProcessLiveCaptureJob::dispatch($video, $job);
++
++            $this->info("Job #{$job->id} dimulai -> video #{$video->id}.");
++        }
++
++        // Jadwal yang sudah lewat waktu selesainya tapi tidak sempat dimulai
++        // sama sekali (mis. server/queue mati saat waktu mulai tiba) --
++        // tandai gagal daripada dibiarkan menggantung selamanya di status
++        // "scheduled".
++        $missed = LiveCaptureJob::query()
++            ->where('status', 'scheduled')
++            ->where('finish_at', '<=', now())
++            ->get();
++
++        foreach ($missed as $job) {
++            $job->update([
++                'status' => 'failed',
++                'error_message' => 'Jadwal terlewat tanpa sempat dimulai (kemungkinan server tidak aktif saat waktu mulai).',
++            ]);
++            $this->warn("Job #{$job->id} ditandai gagal: jadwal terlewat.");
++        }
++
++        return self::SUCCESS;
++    }
++}
+diff --git a/laravel-app/app/Http/Controllers/DashboardController.php b/laravel-app/app/Http/Controllers/DashboardController.php
+index 61e3c52..25ec4d6 100644
+--- a/laravel-app/app/Http/Controllers/DashboardController.php
++++ b/laravel-app/app/Http/Controllers/DashboardController.php
+@@ -56,14 +56,33 @@ class DashboardController extends Controller
+         $totalLocations = JplLocation::count();
+ 
+         $selected = null;
++        $liveJob = null;
++        $liveVideo = null;
++
+         if ($request->filled('lokasi')) {
+             $selected = $locations->firstWhere('id', $request->integer('lokasi'));
+         }
+ 
++        if ($selected) {
++            // Jadwal deteksi live paling relevan untuk lokasi ini: yang
++            // sedang berjalan/baru selesai diutamakan, kalau tidak ada
++            // tampilkan jadwal mendatang supaya admin/user tahu kapan akan
++            // ada hasil deteksi.
++            $liveJob = $selected->liveCaptureJobs()
++                ->whereIn('status', ['running', 'completed', 'failed'])
++                ->latest('start_at')
++                ->first()
++                ?? $selected->liveCaptureJobs()->where('status', 'scheduled')->orderBy('start_at')->first();
++
++            $liveVideo = $liveJob?->video;
++        }
++
+         return view('dashboard.online', [
+             'locations' => $locations,
+             'totalLocations' => $totalLocations,
+             'selected' => $selected,
++            'liveJob' => $liveJob,
++            'liveVideo' => $liveVideo,
+         ]);
+     }
+ 
+diff --git a/laravel-app/app/Http/Controllers/JplLocationController.php b/laravel-app/app/Http/Controllers/JplLocationController.php
+index 1ea744d..6db4158 100644
+--- a/laravel-app/app/Http/Controllers/JplLocationController.php
++++ b/laravel-app/app/Http/Controllers/JplLocationController.php
+@@ -10,14 +10,20 @@ class JplLocationController extends Controller
+ {
+     public function index()
+     {
+-        $locations = JplLocation::withCount('videos')->orderBy('name')->get()->map(function (JplLocation $location) {
+-            $location->safety_event_count = SafetyEvent::whereIn(
+-                'video_id',
+-                $location->videos()->pluck('id')
+-            )->count();
++        $locations = JplLocation::withCount('videos')
++            ->with(['liveCaptureJobs' => function ($query) {
++                $query->whereIn('status', ['scheduled', 'running'])->orderBy('start_at');
++            }])
++            ->orderBy('name')
++            ->get()
++            ->map(function (JplLocation $location) {
++                $location->safety_event_count = SafetyEvent::whereIn(
++                    'video_id',
++                    $location->videos()->pluck('id')
++                )->count();
+ 
+-            return $location;
+-        });
++                return $location;
++            });
+ 
+         return view('locations.index', compact('locations'));
+     }
+diff --git a/laravel-app/app/Http/Controllers/LiveCaptureJobController.php b/laravel-app/app/Http/Controllers/LiveCaptureJobController.php
+new file mode 100644
+index 0000000..1728025
+--- /dev/null
++++ b/laravel-app/app/Http/Controllers/LiveCaptureJobController.php
+@@ -0,0 +1,110 @@
++<?php
++
++namespace App\Http\Controllers;
++
++use App\Models\JplLocation;
++use App\Models\LiveCaptureJob;
++use App\Services\DetectorClient;
++use Carbon\Carbon;
++use Illuminate\Http\Request;
++use Throwable;
++
++/**
++ * Penjadwalan deteksi live CCTV per lokasi JPL. Admin menentukan rentang
++ * waktu mulai/selesai di masa depan, mengambil snapshot terkini dari stream
++ * untuk menggambar ulang zona (arah/bahaya), lalu menyimpan jadwalnya.
++ * Eksekusi sebenarnya (memicu detector-service) terjadi belakangan lewat
++ * App\Console\Commands\StartDueLiveCaptureJobs saat start_at tiba.
++ */
++class LiveCaptureJobController extends Controller
++{
++    public function snapshot(JplLocation $location, DetectorClient $detector)
++    {
++        abort_unless($location->cctv_url, 422, 'Lokasi ini belum memiliki URL CCTV.');
++
++        try {
++            $result = $detector->captureSnapshot($location->cctv_url);
++        } catch (Throwable $e) {
++            return response()->json(['error' => $e->getMessage()], 422);
++        }
++
++        $filename = basename($result['path'] ?? '');
++
++        if ($filename === '') {
++            return response()->json(['error' => 'Respons snapshot tidak valid dari detector service.'], 422);
++        }
++
++        return response()->json([
++            'width' => $result['width'] ?? null,
++            'height' => $result['height'] ?? null,
++            'image_url' => route('locations.live-jobs.snapshot-image', ['filename' => $filename]),
++        ]);
++    }
++
++    public function showSnapshot(string $filename)
++    {
++        $safe = basename($filename);
++        $path = storage_path('app/videos/live-snapshots/'.$safe);
++
++        abort_unless(file_exists($path), 404);
++
++        return response()->file($path);
++    }
++
++    public function store(Request $request, JplLocation $location)
++    {
++        abort_unless($location->cctv_url, 422, 'Lokasi ini belum memiliki URL CCTV.');
++
++        $validated = $request->validateWithBag('liveJob', [
++            'start_at' => ['required', 'date', 'after:now'],
++            'finish_at' => ['required', 'date', 'after:start_at'],
++            'zones_json' => ['required', 'string'],
++        ], [
++            'start_at.after' => 'Waktu mulai harus di masa depan.',
++            'finish_at.after' => 'Waktu selesai harus setelah waktu mulai.',
++        ]);
++
++        $start = Carbon::parse($validated['start_at']);
++        $finish = Carbon::parse($validated['finish_at']);
++
++        $maxHours = 6;
++        if ($start->diffInMinutes($finish) > $maxHours * 60) {
++            return back()->withErrors(['finish_at' => "Durasi deteksi live maksimal {$maxHours} jam per penjadwalan."], 'liveJob')->withInput();
++        }
++
++        $zones = json_decode($validated['zones_json'], true);
++
++        if (! is_array($zones) || count($zones) < 1) {
++            return back()->withErrors(['zones_json' => 'Silakan gambar minimal satu zona pada snapshot CCTV.'], 'liveJob')->withInput();
++        }
++
++        foreach ($zones as $zone) {
++            if (empty($zone['name']) || empty($zone['points']) || count($zone['points']) < 3) {
++                return back()->withErrors(['zones_json' => 'Setiap zona harus memiliki nama dan minimal 3 titik.'], 'liveJob')->withInput();
++            }
++        }
++
++        LiveCaptureJob::create([
++            'jpl_location_id' => $location->id,
++            'cctv_url' => $location->cctv_url,
++            'zones' => $zones,
++            'start_at' => $start,
++            'finish_at' => $finish,
++            'status' => 'scheduled',
++        ]);
++
++        return redirect()->route('locations.index')->with(
++            'status',
++            "Jadwal deteksi live untuk {$location->name} berhasil dibuat ({$start->format('d M Y H:i')} — {$finish->format('d M Y H:i')})."
++        );
++    }
++
++    public function cancel(LiveCaptureJob $liveCaptureJob)
++    {
++        abort_unless($liveCaptureJob->isCancelable(), 422, 'Hanya jadwal yang belum dimulai yang bisa dibatalkan.');
++
++        $liveCaptureJob->update(['status' => 'canceled']);
++
++        return redirect()->route('locations.index')->with('status', 'Jadwal deteksi live dibatalkan.');
++    }
++}
+diff --git a/laravel-app/app/Jobs/ProcessLiveCaptureJob.php b/laravel-app/app/Jobs/ProcessLiveCaptureJob.php
+new file mode 100644
+index 0000000..b9cc182
+--- /dev/null
++++ b/laravel-app/app/Jobs/ProcessLiveCaptureJob.php
+@@ -0,0 +1,49 @@
++<?php
++
++namespace App\Jobs;
++
++use App\Models\LiveCaptureJob;
++use App\Models\Video;
++use App\Services\DetectorClient;
++use Illuminate\Bus\Queueable;
++use Illuminate\Contracts\Queue\ShouldQueue;
++use Illuminate\Foundation\Bus\Dispatchable;
++use Illuminate\Queue\InteractsWithQueue;
++use Illuminate\Queue\SerializesModels;
++use Throwable;
++
++/**
++ * Sama seperti ProcessVideoJob (fire-and-forget ke detector-service, hasil
++ * datang belakangan lewat callback), tapi memicu endpoint /process-live
++ * untuk memproses stream CCTV secara langsung selama rentang waktu $job.
++ */
++class ProcessLiveCaptureJob implements ShouldQueue
++{
++    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
++
++    public int $tries = 1;
++
++    public int $timeout = 60;
++
++    public function __construct(public Video $video, public LiveCaptureJob $job)
++    {
++    }
++
++    public function handle(DetectorClient $detector): void
++    {
++        $this->video->update(['status' => 'processing']);
++
++        try {
++            $detector->dispatchLive($this->video, $this->job);
++        } catch (Throwable $e) {
++            $this->video->update([
++                'status' => 'failed',
++                'error_message' => $e->getMessage(),
++            ]);
++            $this->job->update([
++                'status' => 'failed',
++                'error_message' => $e->getMessage(),
++            ]);
++        }
++    }
++}
+diff --git a/laravel-app/app/Models/JplLocation.php b/laravel-app/app/Models/JplLocation.php
+index f52d9b2..a12ac42 100644
+--- a/laravel-app/app/Models/JplLocation.php
++++ b/laravel-app/app/Models/JplLocation.php
+@@ -25,6 +25,11 @@ class JplLocation extends Model
+         return $this->hasMany(Video::class);
+     }
+ 
++    public function liveCaptureJobs(): HasMany
++    {
++        return $this->hasMany(LiveCaptureJob::class);
++    }
++
+     /**
+      * Lokasi ini muncul di Dashboard Online begitu Administrator mengisi URL CCTV.
+      */
+diff --git a/laravel-app/app/Models/LiveCaptureJob.php b/laravel-app/app/Models/LiveCaptureJob.php
+new file mode 100644
+index 0000000..fd3a937
+--- /dev/null
++++ b/laravel-app/app/Models/LiveCaptureJob.php
+@@ -0,0 +1,53 @@
++<?php
++
++namespace App\Models;
++
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\BelongsTo;
++
++class LiveCaptureJob extends Model
++{
++    protected $fillable = [
++        'jpl_location_id',
++        'video_id',
++        'cctv_url',
++        'zones',
++        'start_at',
++        'finish_at',
++        'status',
++        'error_message',
++    ];
++
++    protected $casts = [
++        'zones' => 'array',
++        'start_at' => 'datetime',
++        'finish_at' => 'datetime',
++    ];
++
++    public function jplLocation(): BelongsTo
++    {
++        return $this->belongsTo(JplLocation::class);
++    }
++
++    public function video(): BelongsTo
++    {
++        return $this->belongsTo(Video::class);
++    }
++
++    public function isCancelable(): bool
++    {
++        return $this->status === 'scheduled';
++    }
++
++    public function statusLabel(): string
++    {
++        return match ($this->status) {
++            'scheduled' => 'Terjadwal',
++            'running' => 'Berjalan',
++            'completed' => 'Selesai',
++            'failed' => 'Gagal',
++            'canceled' => 'Dibatalkan',
++            default => $this->status,
++        };
++    }
++}
+diff --git a/laravel-app/app/Models/Video.php b/laravel-app/app/Models/Video.php
+index 333eb84..f29a088 100644
+--- a/laravel-app/app/Models/Video.php
++++ b/laravel-app/app/Models/Video.php
+@@ -6,6 +6,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
+ use Illuminate\Database\Eloquent\Model;
+ use Illuminate\Database\Eloquent\Relations\BelongsTo;
+ use Illuminate\Database\Eloquent\Relations\HasMany;
++use Illuminate\Database\Eloquent\Relations\HasOne;
+ 
+ class Video extends Model
+ {
+@@ -51,6 +52,20 @@ class Video extends Model
+         return $this->hasMany(SafetyEvent::class);
+     }
+ 
++    /**
++     * Relasi balik ke jadwal deteksi live yang menghasilkan video ini (null
++     * kalau video ini berasal dari unggahan manual, bukan CCTV terjadwal).
++     */
++    public function liveCaptureJob(): HasOne
++    {
++        return $this->hasOne(LiveCaptureJob::class);
++    }
++
++    public function isFromLiveCapture(): bool
++    {
++        return $this->liveCaptureJob !== null;
++    }
++
+     /**
+      * Kelompokkan hasil hitung per kelas objek & zona: ['car' => ['Rel Kiri' => 3, 'Rel Kanan' => 1], ...]
+      */
+diff --git a/laravel-app/app/Services/DetectorClient.php b/laravel-app/app/Services/DetectorClient.php
+index 5edccf8..c7f4ca3 100644
+--- a/laravel-app/app/Services/DetectorClient.php
++++ b/laravel-app/app/Services/DetectorClient.php
+@@ -2,6 +2,7 @@
+ 
+ namespace App\Services;
+ 
++use App\Models\LiveCaptureJob;
+ use App\Models\Video;
+ use Illuminate\Support\Facades\Http;
+ use Illuminate\Support\Facades\URL;
+@@ -52,4 +53,57 @@ class DetectorClient
+             );
+         }
+     }
++
++    /**
++     * Ambil satu frame dari URL CCTV, dipakai admin saat menjadwalkan
++     * deteksi live supaya bisa menggambar ulang zona di atas kondisi kamera
++     * terkini. Mengembalikan ['path' => 'live-snapshots/xxx.jpg', 'width' => .., 'height' => ..].
++     */
++    public function captureSnapshot(string $url): array
++    {
++        $response = Http::timeout(30)->post("{$this->baseUrl}/snapshot", ['url' => $url]);
++
++        if (! $response->successful()) {
++            throw new RuntimeException(
++                'Gagal mengambil snapshot dari CCTV: '.$response->status().' '.$response->body()
++            );
++        }
++
++        return $response->json();
++    }
++
++    /**
++     * Minta detector-service memproses stream CCTV SECARA LANGSUNG (live),
++     * tanpa merekam ke file dulu, selama rentang waktu terjadwal pada
++     * $job. Hasilnya dikirim balik lewat callback HTTP yang SAMA dengan
++     * mode unggah file (VideoCallbackController), memakai $video->id
++     * sebagai job_id -- jadi hasilnya otomatis tersimpan sebagai Video biasa.
++     */
++    public function dispatchLive(Video $video, LiveCaptureJob $job): void
++    {
++        $response = Http::timeout(15)->post("{$this->baseUrl}/process-live", [
++            'job_id' => $video->id,
++            'stream_url' => $job->cctv_url,
++            'location_name' => $job->jplLocation?->name ?? 'JPL',
++            'start_at' => $job->start_at->toIso8601String(),
++            'finish_at' => $job->finish_at->toIso8601String(),
++            'zones' => $video->zones->map(fn ($zone) => [
++                'name' => $zone->name,
++                'type' => $zone->type,
++                'points' => $zone->points,
++                'color' => $zone->color,
++            ])->values()->all(),
++            'classes' => ['person', 'bicycle', 'car', 'motorcycle', 'bus', 'truck'],
++            'danger_dwell_seconds' => (float) config('services.detector.danger_dwell_seconds', 5),
++            'callback_url' => URL::to("/api/videos/{$video->id}/callback"),
++            'progress_url' => URL::to("/api/videos/{$video->id}/progress"),
++            'callback_secret' => $this->callbackSecret,
++        ]);
++
++        if (! $response->successful()) {
++            throw new RuntimeException(
++                'Gagal menghubungi detector service (live): '.$response->status().' '.$response->body()
++            );
++        }
++    }
+ }
+diff --git a/laravel-app/database/migrations/2026_08_19_000002_create_live_capture_jobs_table.php b/laravel-app/database/migrations/2026_08_19_000002_create_live_capture_jobs_table.php
+new file mode 100644
+index 0000000..7e7520c
+--- /dev/null
++++ b/laravel-app/database/migrations/2026_08_19_000002_create_live_capture_jobs_table.php
+@@ -0,0 +1,39 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++/**
++ * Jadwal deteksi live: Administrator menentukan rentang waktu mulai/selesai
++ * di masa depan untuk sebuah lokasi JPL, beserta zona yang digambar ulang
++ * dari snapshot CCTV saat penjadwalan dibuat. Saat waktu mulai tiba,
++ * Artisan command sigap:start-due-live-jobs (dijadwalkan tiap menit lewat
++ * routes/console.php) membuat baris `videos` baru untuk job ini dan memicu
++ * detector-service untuk memproses stream CCTV SECARA LANGSUNG (bukan
++ * merekam ke file dulu) lewat endpoint /process-live.
++ */
++return new class extends Migration
++{
++    public function up(): void
++    {
++        Schema::create('live_capture_jobs', function (Blueprint $table) {
++            $table->id();
++            $table->foreignId('jpl_location_id')->constrained()->cascadeOnDelete();
++            $table->foreignId('video_id')->nullable()->constrained()->nullOnDelete();
++            $table->string('cctv_url');
++            $table->json('zones');
++            $table->timestamp('start_at');
++            $table->timestamp('finish_at');
++            // scheduled -> running -> completed|failed, atau dibatalkan -> canceled
++            $table->string('status')->default('scheduled');
++            $table->text('error_message')->nullable();
++            $table->timestamps();
++        });
++    }
++
++    public function down(): void
++    {
++        Schema::dropIfExists('live_capture_jobs');
++    }
++};
+diff --git a/laravel-app/docker/entrypoint.sh b/laravel-app/docker/entrypoint.sh
+index 8187254..49205b8 100644
+--- a/laravel-app/docker/entrypoint.sh
++++ b/laravel-app/docker/entrypoint.sh
+@@ -24,6 +24,16 @@ php artisan migrate --force
+ php artisan sigap:ensure-admin
+ 
+ if [ "$1" = "queue" ]; then
++    # schedule:work menjalankan Laravel Task Scheduling (routes/console.php)
++    # secara terus-menerus, mengecek tiap menit apakah ada jadwal deteksi
++    # live CCTV yang perlu dimulai (lihat sigap:start-due-live-jobs). Tidak
++    # ada proses cron terpisah di image ini, jadi dijalankan berdampingan
++    # dengan queue worker di container yang sama -- di-background-kan
++    # ('&') supaya queue:work tetap bisa jadi proses utama (exec/PID 1)
++    # yang menerima sinyal berhenti dari Docker seperti biasa.
++    echo "Starting scheduler..."
++    php artisan schedule:work &
++
+     echo "Starting queue worker..."
+     exec php artisan queue:work --tries=1 --timeout=1800
+ else
+diff --git a/laravel-app/resources/views/dashboard/online.blade.php b/laravel-app/resources/views/dashboard/online.blade.php
+index 36a8363..016a2b7 100644
+--- a/laravel-app/resources/views/dashboard/online.blade.php
++++ b/laravel-app/resources/views/dashboard/online.blade.php
+@@ -19,8 +19,8 @@
+         </p>
+     </div>
+ @else
+-    <div class="grid gap-8 lg:grid-cols-2">
+-        <div class="bg-white rounded-xl shadow p-6">
++    <div class="grid gap-8 lg:grid-cols-3">
++        <div class="bg-white rounded-xl shadow p-6 lg:col-span-1">
+             <h2 class="text-lg font-semibold mb-4">Lokasi Online ({{ $locations->count() }})</h2>
+             <div class="space-y-3">
+                 @foreach ($locations as $location)
+@@ -38,7 +38,7 @@
+             </div>
+         </div>
+ 
+-        <div class="bg-white rounded-xl shadow p-6">
++        <div class="bg-white rounded-xl shadow p-6 lg:col-span-1">
+             <h2 class="text-lg font-semibold mb-4">Tayangan CCTV</h2>
+             @if (! $selected)
+                 <p class="text-sm text-slate-500">Pilih salah satu lokasi di sebelah kiri untuk menampilkan tayangan CCTV.</p>
+@@ -67,6 +67,40 @@
+                 </p>
+             @endif
+         </div>
++
++        <div class="lg:col-span-1">
++            @if (! $selected)
++                <div class="bg-white rounded-xl shadow p-6 h-full">
++                    <h2 class="text-lg font-semibold mb-1">Video Hasil Deteksi &amp; Tracking</h2>
++                    <p class="text-sm text-slate-500">Pilih salah satu lokasi di sebelah kiri untuk menampilkan hasil deteksi live.</p>
++                </div>
++            @elseif ($liveVideo)
++                @include('videos._result_panel', ['video' => $liveVideo])
++            @elseif ($liveJob && $liveJob->status === 'scheduled')
++                <div class="bg-white rounded-xl shadow p-6 h-full">
++                    <h2 class="text-lg font-semibold mb-1">Video Hasil Deteksi &amp; Tracking</h2>
++                    <p class="text-sm text-slate-500 mb-3">Deteksi live untuk lokasi ini sudah dijadwalkan, belum dimulai.</p>
++                    <div class="rounded-lg border p-3 text-sm">
++                        <div class="font-medium mb-1">Terjadwal</div>
++                        <div class="text-slate-500 text-xs">
++                            {{ $liveJob->start_at->format('d M Y H:i') }} — {{ $liveJob->finish_at->format('d M Y H:i') }}
++                        </div>
++                    </div>
++                </div>
++            @else
++                <div class="bg-white rounded-xl shadow p-6 h-full">
++                    <h2 class="text-lg font-semibold mb-1">Video Hasil Deteksi &amp; Tracking</h2>
++                    <p class="text-sm text-slate-500">
++                        Belum ada jadwal deteksi live untuk lokasi ini.
++                        @if (auth()->user()->isAdmin())
++                            Buka menu <a href="{{ route('locations.index') }}" class="underline">Lokasi JPL</a> untuk menjadwalkannya.
++                        @else
++                            Hubungi Administrator untuk menjadwalkannya.
++                        @endif
++                    </p>
++                </div>
++            @endif
++        </div>
+     </div>
+ @endif
+ @endsection
+diff --git a/laravel-app/resources/views/locations/index.blade.php b/laravel-app/resources/views/locations/index.blade.php
+index e5ba214..b6c4d34 100644
+--- a/laravel-app/resources/views/locations/index.blade.php
++++ b/laravel-app/resources/views/locations/index.blade.php
+@@ -42,6 +42,18 @@
+     <div class="bg-white rounded-xl shadow p-6">
+         <h2 class="text-lg font-semibold mb-4">Daftar Lokasi JPL</h2>
+         <p class="text-xs text-slate-500 mb-4">Isi URL CCTV untuk mengaktifkan Dashboard Online lokasi tersebut. Dashboard Offline aktif otomatis begitu ada video yang diunggah.</p>
++
++        @if ($errors->liveJob->any())
++            <div class="mb-4 rounded-lg bg-red-100 text-red-800 px-4 py-3 text-sm">
++                <p class="font-medium mb-1">Gagal menjadwalkan deteksi live:</p>
++                <ul class="list-disc list-inside">
++                    @foreach ($errors->liveJob->all() as $error)
++                        <li>{{ $error }}</li>
++                    @endforeach
++                </ul>
++                <p class="mt-1 text-xs">Silakan klik "+ Jadwalkan Deteksi Live" pada lokasi yang dituju dan coba lagi.</p>
++            </div>
++        @endif
+         <div class="space-y-3">
+             @forelse ($locations as $location)
+                 <div class="rounded-lg border p-3">
+@@ -71,8 +83,47 @@
+                         <button type="submit" class="text-xs bg-slate-100 hover:bg-slate-200 rounded-lg px-3 py-2 font-medium whitespace-nowrap">Simpan URL</button>
+                     </form>
+ 
++                    @if ($location->cctv_url)
++                        <div class="mt-3 pt-3 border-t">
++                            <div class="flex items-center justify-between flex-wrap gap-2">
++                                <span class="text-xs font-medium text-slate-600">Deteksi Live Terjadwal</span>
++                                <button type="button"
++                                        class="open-scheduler text-xs bg-slate-900 text-white rounded-lg px-3 py-1.5 font-medium whitespace-nowrap"
++                                        data-location-id="{{ $location->id }}"
++                                        data-location-name="{{ $location->name }}"
++                                        data-snapshot-url="{{ route('locations.live-jobs.snapshot', $location) }}"
++                                        data-store-url="{{ route('locations.live-jobs.store', $location) }}">
++                                    + Jadwalkan Deteksi Live
++                                </button>
++                            </div>
++
++                            @forelse ($location->liveCaptureJobs as $job)
++                                <div class="flex items-center justify-between text-xs mt-2 border rounded-lg px-2.5 py-1.5">
++                                    <div>
++                                        <span @class([
++                                            'px-1.5 py-0.5 rounded-full mr-1',
++                                            'bg-yellow-100 text-yellow-800' => $job->status === 'scheduled',
++                                            'bg-blue-100 text-blue-800' => $job->status === 'running',
++                                        ])>{{ $job->statusLabel() }}</span>
++                                        {{ $job->start_at->format('d M Y H:i') }} — {{ $job->finish_at->format('d M Y H:i') }}
++                                    </div>
++                                    @if ($job->isCancelable())
++                                        <form action="{{ route('live-jobs.cancel', $job) }}" method="POST"
++                                              onsubmit="return confirm('Batalkan jadwal deteksi live ini?');">
++                                            @csrf
++                                            @method('DELETE')
++                                            <button type="submit" class="text-red-600 underline">Batalkan</button>
++                                        </form>
++                                    @endif
++                                </div>
++                            @empty
++                                <p class="text-xs text-slate-400 mt-2">Belum ada jadwal deteksi live untuk lokasi ini.</p>
++                            @endforelse
++                        </div>
++                    @endif
++
+                     <form action="{{ route('locations.destroy', $location) }}" method="POST"
+-                          class="mt-2"
++                          class="mt-3"
+                           onsubmit="return confirm('Hapus lokasi {{ $location->name }}? Video yang sudah diunggah tidak ikut terhapus, hanya kehilangan tautan lokasinya.');">
+                         @csrf
+                         @method('DELETE')
+@@ -85,4 +136,301 @@
+         </div>
+     </div>
+ </div>
++
++{{-- Panel penjadwalan deteksi live (dipakai bergantian oleh semua lokasi --
++     dibuka lewat tombol "+ Jadwalkan Deteksi Live" di atas). Zona digambar
++     ulang di atas snapshot CCTV TERKINI yang diambil saat panel dibuka,
++     bukan dipakai ulang dari unggahan video sebelumnya. --}}
++<div id="scheduler-backdrop" class="hidden fixed inset-0 bg-black/50 z-40 flex items-center justify-center p-4">
++    <div class="bg-white rounded-xl shadow-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto p-6">
++        <div class="flex items-center justify-between mb-1">
++            <h2 class="text-lg font-semibold">Jadwalkan Deteksi Live — <span id="scheduler-location-name"></span></h2>
++            <button type="button" id="scheduler-close" class="text-slate-400 hover:text-slate-600 text-xl leading-none">&times;</button>
++        </div>
++        <p class="text-sm text-slate-500 mb-4">
++            Stream CCTV akan diproses langsung lewat YOLOv8 (tanpa direkam dulu) selama rentang waktu yang dipilih.
++            Gambar zona di atas snapshot terkini di bawah ini.
++        </p>
++
++        <div id="scheduler-errors" class="hidden mb-4 rounded-lg bg-red-100 text-red-800 px-4 py-3 text-sm"></div>
++
++        <form id="live-job-form" method="POST">
++            @csrf
++
++            <div class="grid grid-cols-2 gap-2 mb-4">
++                <div>
++                    <label class="block text-sm font-medium mb-1">Waktu Mulai</label>
++                    <input type="datetime-local" name="start_at" id="live-start-at" required class="w-full text-sm border rounded-lg p-2">
++                </div>
++                <div>
++                    <label class="block text-sm font-medium mb-1">Waktu Selesai</label>
++                    <input type="datetime-local" name="finish_at" id="live-finish-at" required class="w-full text-sm border rounded-lg p-2">
++                </div>
++            </div>
++
++            <button type="button" id="take-snapshot"
++                    class="w-full mb-3 bg-slate-100 hover:bg-slate-200 rounded-lg py-2 text-sm font-medium">
++                Ambil Snapshot dari CCTV
++            </button>
++            <p id="snapshot-status" class="text-xs text-slate-500 mb-3"></p>
++
++            <div id="snapshot-wrap" class="hidden">
++                <div class="relative w-full bg-black rounded-lg overflow-hidden mb-3">
++                    <canvas id="live-zone-canvas" class="w-full block cursor-crosshair"></canvas>
++                </div>
++
++                <div class="border rounded-lg p-3 mb-3 bg-slate-50">
++                    <p class="text-xs text-slate-500 mb-2">Klik pada gambar untuk menambah titik poligon (minimal 3 titik), lalu isi nama &amp; tipe zona di bawah dan klik "Simpan Zona".</p>
++                    <div class="grid grid-cols-2 gap-2 mb-2">
++                        <input type="text" id="live-zone-name" placeholder="Nama zona (mis. Rel Kiri)" class="text-sm border rounded-lg p-2">
++                        <select id="live-zone-type" class="text-sm border rounded-lg p-2">
++                            <option value="direction">Zona Arah (hitung objek lewat)</option>
++                            <option value="danger">Zona Bahaya (area rel/perlintasan)</option>
++                        </select>
++                    </div>
++                    <div class="flex items-center gap-2 mb-2">
++                        <label class="text-xs text-slate-500">Warna:</label>
++                        <input type="color" id="live-zone-color" value="#22c55e" class="h-8 w-14 border rounded">
++                        <button type="button" id="live-undo-point" class="text-xs text-slate-600 underline ml-auto">Batalkan titik terakhir</button>
++                    </div>
++                    <button type="button" id="live-save-zone" disabled
++                            class="w-full bg-slate-700 text-white rounded-lg py-2 text-sm font-medium disabled:opacity-40">
++                        Simpan Zona (min. 3 titik)
++                    </button>
++                </div>
++
++                <div id="live-zone-list" class="space-y-1 mb-4 text-sm"></div>
++            </div>
++
++            <input type="hidden" name="zones_json" id="live-zones-json">
++
++            <button type="submit" id="live-submit-btn" disabled
++                    class="w-full bg-slate-900 text-white rounded-lg py-2.5 font-medium disabled:opacity-40">
++                Simpan Jadwal
++            </button>
++        </form>
++    </div>
++</div>
++
++<script>
++(function () {
++    const backdrop = document.getElementById('scheduler-backdrop');
++    const locationNameEl = document.getElementById('scheduler-location-name');
++    const form = document.getElementById('live-job-form');
++    const startAtInput = document.getElementById('live-start-at');
++    const finishAtInput = document.getElementById('live-finish-at');
++    const takeSnapshotBtn = document.getElementById('take-snapshot');
++    const snapshotStatus = document.getElementById('snapshot-status');
++    const snapshotWrap = document.getElementById('snapshot-wrap');
++    const canvas = document.getElementById('live-zone-canvas');
++    const ctx = canvas.getContext('2d');
++    const zoneNameInput = document.getElementById('live-zone-name');
++    const zoneTypeSelect = document.getElementById('live-zone-type');
++    const zoneColorInput = document.getElementById('live-zone-color');
++    const saveZoneBtn = document.getElementById('live-save-zone');
++    const undoPointBtn = document.getElementById('live-undo-point');
++    const zoneListEl = document.getElementById('live-zone-list');
++    const submitBtn = document.getElementById('live-submit-btn');
++    const errorsBox = document.getElementById('scheduler-errors');
++
++    const palette = ['#22c55e', '#3b82f6', '#a855f7', '#f97316', '#ef4444', '#eab308'];
++    let paletteIndex = 0;
++    let currentPoints = [];
++    let zones = [];
++    let snapshotImage = null;
++    let snapshotUrl = '';
++
++    function resetPanel() {
++        zones = [];
++        currentPoints = [];
++        snapshotImage = null;
++        snapshotWrap.classList.add('hidden');
++        snapshotStatus.textContent = '';
++        errorsBox.classList.add('hidden');
++        errorsBox.innerHTML = '';
++        zoneNameInput.value = '';
++        paletteIndex = 0;
++        zoneColorInput.value = palette[0];
++        renderZoneList();
++        updateSubmitState();
++
++        const now = new Date(Date.now() - new Date().getTimezoneOffset() * 60000);
++        const soon = new Date(now.getTime() + 5 * 60000);
++        startAtInput.value = soon.toISOString().slice(0, 16);
++        finishAtInput.value = new Date(soon.getTime() + 60 * 60000).toISOString().slice(0, 16);
++    }
++
++    document.querySelectorAll('.open-scheduler').forEach(btn => {
++        btn.addEventListener('click', () => {
++            locationNameEl.textContent = btn.dataset.locationName;
++            form.action = btn.dataset.storeUrl;
++            snapshotUrl = btn.dataset.snapshotUrl;
++            resetPanel();
++            backdrop.classList.remove('hidden');
++        });
++    });
++
++    document.getElementById('scheduler-close').addEventListener('click', () => {
++        backdrop.classList.add('hidden');
++    });
++    backdrop.addEventListener('click', (e) => {
++        if (e.target === backdrop) backdrop.classList.add('hidden');
++    });
++
++    takeSnapshotBtn.addEventListener('click', async () => {
++        takeSnapshotBtn.disabled = true;
++        snapshotStatus.textContent = 'Mengambil snapshot dari CCTV...';
++        try {
++            const res = await fetch(snapshotUrl, {
++                method: 'POST',
++                headers: {
++                    'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content || '{{ csrf_token() }}',
++                    'Accept': 'application/json',
++                },
++            });
++            const data = await res.json();
++            if (!res.ok) {
++                snapshotStatus.textContent = data.error || 'Gagal mengambil snapshot.';
++                takeSnapshotBtn.disabled = false;
++                return;
++            }
++
++            snapshotImage = new Image();
++            snapshotImage.onload = () => {
++                canvas.width = data.width || snapshotImage.naturalWidth;
++                canvas.height = data.height || snapshotImage.naturalHeight;
++                snapshotWrap.classList.remove('hidden');
++                snapshotStatus.textContent = 'Snapshot berhasil diambil. Gambar zona di atasnya.';
++                draw();
++            };
++            snapshotImage.src = data.image_url;
++        } catch (e) {
++            snapshotStatus.textContent = 'Gagal mengambil snapshot: ' + e.message;
++        } finally {
++            takeSnapshotBtn.disabled = false;
++        }
++    });
++
++    canvas.addEventListener('click', (e) => {
++        if (!snapshotImage) return;
++        const rect = canvas.getBoundingClientRect();
++        const x = (e.clientX - rect.left) / rect.width;
++        const y = (e.clientY - rect.top) / rect.height;
++        currentPoints.push({ x, y });
++        saveZoneBtn.disabled = currentPoints.length < 3;
++        draw();
++    });
++
++    undoPointBtn.addEventListener('click', () => {
++        currentPoints.pop();
++        saveZoneBtn.disabled = currentPoints.length < 3;
++        draw();
++    });
++
++    saveZoneBtn.addEventListener('click', () => {
++        if (currentPoints.length < 3) return;
++
++        const name = zoneNameInput.value.trim() || `Zona ${zones.length + 1}`;
++        zones.push({
++            name,
++            type: zoneTypeSelect.value,
++            color: zoneColorInput.value,
++            points: currentPoints.map(p => [p.x, p.y]),
++        });
++
++        currentPoints = [];
++        zoneNameInput.value = '';
++        saveZoneBtn.disabled = true;
++        paletteIndex = (paletteIndex + 1) % palette.length;
++        zoneColorInput.value = palette[paletteIndex];
++
++        renderZoneList();
++        updateSubmitState();
++        draw();
++    });
++
++    function renderZoneList() {
++        zoneListEl.innerHTML = '';
++        zones.forEach((zone, idx) => {
++            const row = document.createElement('div');
++            row.className = 'flex items-center gap-2 border rounded-lg px-3 py-1.5';
++            row.innerHTML = `
++                <span class="inline-block w-3 h-3 rounded-full" style="background:${zone.color}"></span>
++                <span class="flex-1 truncate">${zone.name}</span>
++                <span class="text-xs text-slate-400">${zone.type === 'danger' ? 'Bahaya' : 'Arah'}</span>
++                <button type="button" data-idx="${idx}" class="delete-live-zone text-xs text-red-600 underline">Hapus</button>
++            `;
++            zoneListEl.appendChild(row);
++        });
++
++        document.querySelectorAll('.delete-live-zone').forEach(btn => {
++            btn.addEventListener('click', () => {
++                zones.splice(Number(btn.dataset.idx), 1);
++                renderZoneList();
++                updateSubmitState();
++                draw();
++            });
++        });
++    }
++
++    function updateSubmitState() {
++        document.getElementById('live-zones-json').value = JSON.stringify(zones);
++        submitBtn.disabled = zones.length < 1 || !snapshotImage;
++    }
++
++    function draw() {
++        if (!snapshotImage) return;
++        ctx.clearRect(0, 0, canvas.width, canvas.height);
++        ctx.drawImage(snapshotImage, 0, 0, canvas.width, canvas.height);
++
++        zones.forEach(zone => {
++            ctx.beginPath();
++            zone.points.forEach((p, i) => {
++                const px = p[0] * canvas.width, py = p[1] * canvas.height;
++                if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
++            });
++            ctx.closePath();
++            ctx.strokeStyle = zone.color;
++            ctx.lineWidth = 2;
++            ctx.stroke();
++            if (zone.type === 'danger') {
++                ctx.fillStyle = zone.color + '33';
++                ctx.fill();
++            }
++            const first = zone.points[0];
++            ctx.fillStyle = zone.color;
++            ctx.font = '12px sans-serif';
++            ctx.fillText(zone.name, first[0] * canvas.width + 4, first[1] * canvas.height - 4);
++        });
++
++        if (currentPoints.length) {
++            ctx.beginPath();
++            currentPoints.forEach((p, i) => {
++                const px = p.x * canvas.width, py = p.y * canvas.height;
++                if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
++            });
++            ctx.strokeStyle = zoneColorInput.value;
++            ctx.lineWidth = 2;
++            ctx.setLineDash([4, 4]);
++            ctx.stroke();
++            ctx.setLineDash([]);
++
++            currentPoints.forEach(p => {
++                ctx.beginPath();
++                ctx.arc(p.x * canvas.width, p.y * canvas.height, 4, 0, Math.PI * 2);
++                ctx.fillStyle = zoneColorInput.value;
++                ctx.fill();
++            });
++        }
++    }
++
++    form.addEventListener('submit', (e) => {
++        updateSubmitState();
++        if (zones.length < 1) {
++            e.preventDefault();
++            alert('Silakan gambar dan simpan minimal satu zona terlebih dahulu.');
++        }
++    });
++})();
++</script>
+ @endsection
+diff --git a/laravel-app/resources/views/videos/_result_panel.blade.php b/laravel-app/resources/views/videos/_result_panel.blade.php
+new file mode 100644
+index 0000000..76221ad
+--- /dev/null
++++ b/laravel-app/resources/views/videos/_result_panel.blade.php
+@@ -0,0 +1,182 @@
++{{-- Panel "Video Hasil Deteksi & Tracking" -- dipakai di halaman detail video
++     (videos/show.blade.php) maupun di Dashboard Online (dashboard/online.blade.php)
++     untuk video hasil deteksi live. Membutuhkan variabel $video. --}}
++<div class="bg-white rounded-xl shadow p-6">
++    <div class="flex items-center justify-between mb-1 flex-wrap gap-2">
++        <h2 class="font-medium">Video Hasil Deteksi &amp; Tracking</h2>
++        <span id="status-badge-{{ $video->id }}" class="text-xs px-2 py-0.5 rounded-full bg-slate-100">{{ $video->status }}</span>
++    </div>
++
++    <div id="processing-msg-{{ $video->id }}" class="mb-4 {{ in_array($video->status, ['completed', 'failed']) ? 'hidden' : '' }}">
++        <p class="text-sm text-slate-500 mb-2">
++            Video sedang diproses oleh model deteksi (YOLOv8)... panel ini akan diperbarui otomatis.
++        </p>
++        <div class="w-full bg-slate-200 rounded-full h-3 overflow-hidden">
++            <div id="progress-bar-{{ $video->id }}" class="bg-slate-900 h-3 rounded-full transition-all duration-500" style="width: {{ $video->progress }}%"></div>
++        </div>
++        <p class="text-xs text-slate-500 mt-1"><span id="progress-text-{{ $video->id }}">{{ $video->progress }}</span>%</p>
++    </div>
++
++    <div id="error-msg-{{ $video->id }}" class="text-sm text-red-600 mb-4 {{ $video->status === 'failed' ? '' : 'hidden' }}">
++        {{ $video->error_message }}
++    </div>
++
++    <div id="result-section-{{ $video->id }}" class="{{ $video->status === 'completed' ? '' : 'hidden' }}">
++        <div class="grid gap-6 md:grid-cols-2 mb-6">
++            <div>
++                <video id="annotated-video-{{ $video->id }}" controls class="w-full rounded-lg bg-black"
++                       src="{{ $video->annotated_path ? route('videos.annotated', $video) : '' }}"></video>
++            </div>
++            <div>
++                <h3 class="text-sm font-medium mb-2">Total per Kategori</h3>
++                <canvas id="chart-{{ $video->id }}"></canvas>
++            </div>
++        </div>
++
++        <h3 class="text-sm font-medium mb-2">Rincian per Zona</h3>
++        <table class="w-full text-sm border-collapse mb-6" id="results-table-{{ $video->id }}">
++            <thead>
++                <tr class="text-left border-b">
++                    <th class="py-2">Zona</th>
++                    <th class="py-2">Kategori</th>
++                    <th class="py-2">Jumlah</th>
++                </tr>
++            </thead>
++            <tbody></tbody>
++        </table>
++
++        <div class="flex items-center justify-between mb-2">
++            <h3 class="text-sm font-medium">Safety Event (Objek di Zona Bahaya)</h3>
++            <span id="safety-count-badge-{{ $video->id }}" class="text-xs px-2 py-0.5 rounded-full bg-slate-100">0 kejadian</span>
++        </div>
++        <div id="safety-events-{{ $video->id }}" class="space-y-2"></div>
++    </div>
++</div>
++
++<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
++<script>
++(function () {
++    const videoId = {{ $video->id }};
++    const statusUrl = "{{ route('videos.status', $video) }}";
++    let chart = null;
++    let polling = {{ in_array($video->status, ['completed', 'failed']) ? 'false' : 'true' }};
++
++    const labelMap = { car: 'Mobil', motorcycle: 'Motor', bicycle: 'Sepeda', person: 'Orang', bus: 'Bus', truck: 'Truk' };
++
++    function el(id) { return document.getElementById(id + '-' + videoId); }
++
++    function render(data) {
++        el('status-badge').textContent = data.status;
++
++        if (data.status === 'failed') {
++            el('processing-msg').classList.add('hidden');
++            el('error-msg').classList.remove('hidden');
++            el('error-msg').textContent = data.error_message || 'Terjadi kesalahan.';
++            polling = false;
++            return;
++        }
++
++        if (data.status !== 'completed') {
++            const pct = data.progress || 0;
++            el('progress-bar').style.width = pct + '%';
++            el('progress-text').textContent = pct;
++            return;
++        }
++
++        el('progress-bar').style.width = '100%';
++        el('progress-text').textContent = 100;
++        polling = false;
++        el('processing-msg').classList.add('hidden');
++        el('result-section').classList.remove('hidden');
++
++        if (data.annotated_url) {
++            el('annotated-video').src = data.annotated_url;
++        }
++
++        renderTotals(data.totals || {});
++        renderSafetyEvents(data.safety_events || []);
++    }
++
++    function renderTotals(totals) {
++        const tbody = el('results-table').querySelector('tbody');
++        tbody.innerHTML = '';
++
++        const classTotals = {};
++        const rows = [];
++
++        Object.keys(totals).forEach(className => {
++            const zones = totals[className];
++            Object.keys(zones).forEach(zoneName => {
++                const count = zones[zoneName];
++                rows.push({ className, zoneName, count });
++                classTotals[className] = (classTotals[className] || 0) + count;
++            });
++        });
++
++        rows.sort((a, b) => a.zoneName.localeCompare(b.zoneName));
++        rows.forEach(r => {
++            const tr = document.createElement('tr');
++            tr.className = 'border-b';
++            tr.innerHTML = `<td class="py-2">${r.zoneName}</td><td class="py-2">${labelMap[r.className] || r.className}</td><td class="py-2 font-medium">${r.count}</td>`;
++            tbody.appendChild(tr);
++        });
++
++        const labels = Object.keys(classTotals).map(c => labelMap[c] || c);
++        const values = Object.values(classTotals);
++
++        if (chart) chart.destroy();
++        chart = new Chart(el('chart'), {
++            type: 'bar',
++            data: { labels, datasets: [{ label: 'Total', data: values, backgroundColor: '#0f172a' }] },
++            options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, ticks: { precision: 0 } } } }
++        });
++    }
++
++    function formatDuration(sec) {
++        const m = Math.floor(sec / 60);
++        const s = Math.round(sec % 60);
++        return m > 0 ? `${m}m ${s}s` : `${s}s`;
++    }
++
++    function renderSafetyEvents(events) {
++        const container = el('safety-events');
++        const badge = el('safety-count-badge');
++        badge.textContent = `${events.length} kejadian`;
++        badge.className = 'text-xs px-2 py-0.5 rounded-full ' + (events.length > 0 ? 'bg-red-100 text-red-800' : 'bg-slate-100');
++
++        container.innerHTML = '';
++
++        if (events.length === 0) {
++            container.innerHTML = '<p class="text-sm text-slate-500">Tidak ada objek yang terdeteksi berhenti/diam di zona bahaya.</p>';
++            return;
++        }
++
++        events.forEach(ev => {
++            const card = document.createElement('div');
++            card.className = 'flex items-center gap-3 border border-red-200 bg-red-50 rounded-lg p-3';
++            card.innerHTML = `
++                ${ev.snapshot_url ? `<img src="${ev.snapshot_url}" class="w-24 h-16 object-cover rounded border" alt="snapshot">` : ''}
++                <div class="text-sm flex-1">
++                    <div class="font-medium text-red-800">${labelMap[ev.class_name] || ev.class_name} di "${ev.zone_name}"</div>
++                    <div class="text-red-600 text-xs">Mulai menit ke-${formatDuration(ev.video_time_seconds)} · diam selama ${formatDuration(ev.duration_seconds)}</div>
++                </div>
++            `;
++            container.appendChild(card);
++        });
++    }
++
++    async function poll() {
++        if (!polling) return;
++        try {
++            const res = await fetch(statusUrl);
++            const data = await res.json();
++            render(data);
++        } catch (e) {
++            console.error(e);
++        }
++        if (polling) setTimeout(poll, 3000);
++    }
++
++    poll();
++})();
++</script>
+diff --git a/laravel-app/resources/views/videos/show.blade.php b/laravel-app/resources/views/videos/show.blade.php
+index 98e3523..75739c9 100644
+--- a/laravel-app/resources/views/videos/show.blade.php
++++ b/laravel-app/resources/views/videos/show.blade.php
+@@ -3,183 +3,14 @@
+ @section('title', $video->original_name)
+ 
+ @section('content')
+-<div class="bg-white rounded-xl shadow p-6">
+-    <div class="flex items-center justify-between mb-1 flex-wrap gap-2">
+-        <h1 class="text-xl font-semibold">{{ $video->original_name }}</h1>
+-        <span id="status-badge" class="text-xs px-2 py-0.5 rounded-full bg-slate-100">{{ $video->status }}</span>
+-    </div>
+-    <p class="text-sm text-slate-500 mb-4">
++<div class="bg-white rounded-xl shadow p-6 mb-6">
++    <h1 class="text-xl font-semibold mb-1">{{ $video->original_name }}</h1>
++    <p class="text-sm text-slate-500">
+         {{ $video->jplLocation?->name ?? 'Tanpa lokasi' }}
+         @if ($video->recorded_at) · {{ $video->recorded_at->format('d M Y H:i') }} @endif
++        @if ($video->isFromLiveCapture()) · <span class="text-xs px-2 py-0.5 rounded-full bg-blue-100 text-blue-800">Deteksi Live</span> @endif
+     </p>
+-
+-    <div id="processing-msg" class="mb-4 {{ in_array($video->status, ['completed', 'failed']) ? 'hidden' : '' }}">
+-        <p class="text-sm text-slate-500 mb-2">
+-            Video sedang diproses oleh model deteksi (YOLOv8)... halaman ini akan diperbarui otomatis.
+-        </p>
+-        <div class="w-full bg-slate-200 rounded-full h-3 overflow-hidden">
+-            <div id="progress-bar" class="bg-slate-900 h-3 rounded-full transition-all duration-500" style="width: {{ $video->progress }}%"></div>
+-        </div>
+-        <p class="text-xs text-slate-500 mt-1"><span id="progress-text">{{ $video->progress }}</span>%</p>
+-    </div>
+-
+-    <div id="error-msg" class="text-sm text-red-600 mb-4 {{ $video->status === 'failed' ? '' : 'hidden' }}">
+-        {{ $video->error_message }}
+-    </div>
+-
+-    <div id="result-section" class="{{ $video->status === 'completed' ? '' : 'hidden' }}">
+-        <div class="grid gap-6 md:grid-cols-2 mb-6">
+-            <div>
+-                <h2 class="font-medium mb-2">Video Hasil Deteksi &amp; Tracking</h2>
+-                <video id="annotated-video" controls class="w-full rounded-lg bg-black"
+-                       src="{{ $video->annotated_path ? route('videos.annotated', $video) : '' }}"></video>
+-            </div>
+-            <div>
+-                <h2 class="font-medium mb-2">Total per Kategori</h2>
+-                <canvas id="chart"></canvas>
+-            </div>
+-        </div>
+-
+-        <h2 class="font-medium mb-2">Rincian per Zona</h2>
+-        <table class="w-full text-sm border-collapse mb-8" id="results-table">
+-            <thead>
+-                <tr class="text-left border-b">
+-                    <th class="py-2">Zona</th>
+-                    <th class="py-2">Kategori</th>
+-                    <th class="py-2">Jumlah</th>
+-                </tr>
+-            </thead>
+-            <tbody></tbody>
+-        </table>
+-
+-        <div class="flex items-center justify-between mb-2">
+-            <h2 class="font-medium">Safety Event (Objek di Zona Bahaya)</h2>
+-            <span id="safety-count-badge" class="text-xs px-2 py-0.5 rounded-full bg-slate-100">0 kejadian</span>
+-        </div>
+-        <div id="safety-events" class="space-y-2"></div>
+-    </div>
+ </div>
+ 
+-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+-<script>
+-const statusUrl = "{{ route('videos.status', $video) }}";
+-let chart = null;
+-let polling = {{ in_array($video->status, ['completed', 'failed']) ? 'false' : 'true' }};
+-
+-const labelMap = { car: 'Mobil', motorcycle: 'Motor', bicycle: 'Sepeda', person: 'Orang', bus: 'Bus', truck: 'Truk' };
+-
+-function render(data) {
+-    document.getElementById('status-badge').textContent = data.status;
+-
+-    if (data.status === 'failed') {
+-        document.getElementById('processing-msg').classList.add('hidden');
+-        document.getElementById('error-msg').classList.remove('hidden');
+-        document.getElementById('error-msg').textContent = data.error_message || 'Terjadi kesalahan.';
+-        polling = false;
+-        return;
+-    }
+-
+-    if (data.status !== 'completed') {
+-        const pct = data.progress || 0;
+-        document.getElementById('progress-bar').style.width = pct + '%';
+-        document.getElementById('progress-text').textContent = pct;
+-        return;
+-    }
+-
+-    document.getElementById('progress-bar').style.width = '100%';
+-    document.getElementById('progress-text').textContent = 100;
+-    polling = false;
+-    document.getElementById('processing-msg').classList.add('hidden');
+-    document.getElementById('result-section').classList.remove('hidden');
+-
+-    if (data.annotated_url) {
+-        document.getElementById('annotated-video').src = data.annotated_url;
+-    }
+-
+-    renderTotals(data.totals || {});
+-    renderSafetyEvents(data.safety_events || []);
+-}
+-
+-function renderTotals(totals) {
+-    const tbody = document.querySelector('#results-table tbody');
+-    tbody.innerHTML = '';
+-
+-    const classTotals = {};
+-    const rows = [];
+-
+-    Object.keys(totals).forEach(className => {
+-        const zones = totals[className];
+-        Object.keys(zones).forEach(zoneName => {
+-            const count = zones[zoneName];
+-            rows.push({ className, zoneName, count });
+-            classTotals[className] = (classTotals[className] || 0) + count;
+-        });
+-    });
+-
+-    rows.sort((a, b) => a.zoneName.localeCompare(b.zoneName));
+-    rows.forEach(r => {
+-        const tr = document.createElement('tr');
+-        tr.className = 'border-b';
+-        tr.innerHTML = `<td class="py-2">${r.zoneName}</td><td class="py-2">${labelMap[r.className] || r.className}</td><td class="py-2 font-medium">${r.count}</td>`;
+-        tbody.appendChild(tr);
+-    });
+-
+-    const labels = Object.keys(classTotals).map(c => labelMap[c] || c);
+-    const values = Object.values(classTotals);
+-
+-    if (chart) chart.destroy();
+-    chart = new Chart(document.getElementById('chart'), {
+-        type: 'bar',
+-        data: { labels, datasets: [{ label: 'Total', data: values, backgroundColor: '#0f172a' }] },
+-        options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, ticks: { precision: 0 } } } }
+-    });
+-}
+-
+-function formatDuration(sec) {
+-    const m = Math.floor(sec / 60);
+-    const s = Math.round(sec % 60);
+-    return m > 0 ? `${m}m ${s}s` : `${s}s`;
+-}
+-
+-function renderSafetyEvents(events) {
+-    const container = document.getElementById('safety-events');
+-    const badge = document.getElementById('safety-count-badge');
+-    badge.textContent = `${events.length} kejadian`;
+-    badge.className = 'text-xs px-2 py-0.5 rounded-full ' + (events.length > 0 ? 'bg-red-100 text-red-800' : 'bg-slate-100');
+-
+-    container.innerHTML = '';
+-
+-    if (events.length === 0) {
+-        container.innerHTML = '<p class="text-sm text-slate-500">Tidak ada objek yang terdeteksi berhenti/diam di zona bahaya.</p>';
+-        return;
+-    }
+-
+-    events.forEach(ev => {
+-        const card = document.createElement('div');
+-        card.className = 'flex items-center gap-3 border border-red-200 bg-red-50 rounded-lg p-3';
+-        card.innerHTML = `
+-            ${ev.snapshot_url ? `<img src="${ev.snapshot_url}" class="w-24 h-16 object-cover rounded border" alt="snapshot">` : ''}
+-            <div class="text-sm flex-1">
+-                <div class="font-medium text-red-800">${labelMap[ev.class_name] || ev.class_name} di "${ev.zone_name}"</div>
+-                <div class="text-red-600 text-xs">Mulai menit ke-${formatDuration(ev.video_time_seconds)} · diam selama ${formatDuration(ev.duration_seconds)}</div>
+-            </div>
+-        `;
+-        container.appendChild(card);
+-    });
+-}
+-
+-async function poll() {
+-    if (!polling) return;
+-    try {
+-        const res = await fetch(statusUrl);
+-        const data = await res.json();
+-        render(data);
+-    } catch (e) {
+-        console.error(e);
+-    }
+-    if (polling) setTimeout(poll, 3000);
+-}
+-
+-poll();
+-</script>
++@include('videos._result_panel', ['video' => $video])
+ @endsection
+diff --git a/laravel-app/routes/console.php b/laravel-app/routes/console.php
+index 3c9adf1..7838a01 100644
+--- a/laravel-app/routes/console.php
++++ b/laravel-app/routes/console.php
+@@ -2,7 +2,13 @@
+ 
+ use Illuminate\Foundation\Inspiring;
+ use Illuminate\Support\Facades\Artisan;
++use Illuminate\Support\Facades\Schedule;
+ 
+ Artisan::command('inspire', function () {
+     $this->comment(Inspiring::quote());
+ })->purpose('Display an inspiring quote');
++
++// Mulai jadwal deteksi live CCTV yang waktunya sudah tiba. Dijalankan oleh
++// `php artisan schedule:work`, yang di-start berdampingan dengan queue
++// worker di container "queue" -- lihat docker/entrypoint.sh.
++Schedule::command('sigap:start-due-live-jobs')->everyMinute()->withoutOverlapping();
+diff --git a/laravel-app/routes/web.php b/laravel-app/routes/web.php
+index 3b9f01b..e510ab2 100644
+--- a/laravel-app/routes/web.php
++++ b/laravel-app/routes/web.php
+@@ -3,6 +3,7 @@
+ use App\Http\Controllers\AuthController;
+ use App\Http\Controllers\DashboardController;
+ use App\Http\Controllers\JplLocationController;
++use App\Http\Controllers\LiveCaptureJobController;
+ use App\Http\Controllers\UserController;
+ use App\Http\Controllers\VideoCallbackController;
+ use App\Http\Controllers\VideoController;
+@@ -27,6 +28,15 @@ Route::middleware(['auth', 'admin'])->group(function () {
+     Route::post('/locations/{location}/cctv', [JplLocationController::class, 'updateCctv'])->name('locations.cctv');
+     Route::delete('/locations/{location}', [JplLocationController::class, 'destroy'])->name('locations.destroy');
+ 
++    // Penjadwalan deteksi live CCTV (proses langsung tanpa merekam ke file
++    // dulu) -- lihat App\Http\Controllers\LiveCaptureJobController.
++    Route::post('/locations/{location}/live-jobs/snapshot', [LiveCaptureJobController::class, 'snapshot'])->name('locations.live-jobs.snapshot');
++    Route::post('/locations/{location}/live-jobs', [LiveCaptureJobController::class, 'store'])->name('locations.live-jobs.store');
++    Route::delete('/live-jobs/{liveCaptureJob}', [LiveCaptureJobController::class, 'cancel'])->name('live-jobs.cancel');
++    Route::get('/live-snapshots/{filename}', [LiveCaptureJobController::class, 'showSnapshot'])
++        ->name('locations.live-jobs.snapshot-image')
++        ->where('filename', '[A-Za-z0-9_\-\.]+');
++
+     Route::get('/users', [UserController::class, 'index'])->name('users.index');
+     Route::post('/users', [UserController::class, 'store'])->name('users.store');
+     Route::post('/users/{user}/toggle', [UserController::class, 'toggle'])->name('users.toggle');
+-- 
+2.43.0
+

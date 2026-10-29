@@ -1,0 +1,955 @@
+From d7941f0cc3668285b6b5639e600c2597b4c439f9 Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.com>
+Date: Wed, 19 Aug 2026 03:48:49 +0000
+Subject: [PATCH] feat: user management dengan role admin/user + Dashboard
+ Online/Offline
+
+- Tambah kolom role & is_active ke tabel users (migration, default admin
+  untuk akun yang sudah ada supaya tidak ada yang terkunci keluar).
+- Tambah middleware EnsureUserIsAdmin ('admin' alias) yang membatasi
+  Unggah Video, Lokasi JPL, dan Kelola Pengguna hanya untuk role admin;
+  user biasa yang membuka rute tsb diarahkan balik ke Dashboard.
+- Tambah UserController (Kelola Pengguna): tambah/nonaktifkan/reset
+  password/hapus akun, dengan proteksi supaya minimal satu admin aktif
+  selalu tersisa.
+- Tambah kolom cctv_url & cctv_added_at ke jpl_locations + form di
+  halaman Lokasi JPL -- begitu diisi, lokasi tsb otomatis muncul di
+  Dashboard Online.
+- Pecah halaman Dashboard jadi dua: Dashboard Online (tayangan CCTV live
+  per lokasi) dan Dashboard Offline (konten dashboard lama: ringkasan,
+  riwayat video, export CSV), dengan tab switcher di antara keduanya.
+- Navbar sekarang berbeda per role: admin lihat Unggah Video/Lokasi
+  JPL/Kelola Pengguna (tanpa menu Dashboard), user biasa hanya lihat
+  dropdown Dashboard (Online & Offline).
+- Login & redirect setelah login menyesuaikan role; akun nonaktif tidak
+  bisa login.
+- EnsureAdminUser command selalu set role=admin & is_active=true untuk
+  akun dari ADMIN_EMAIL/ADMIN_PASSWORD, supaya tidak pernah terkunci.
+
+Catatan: pengujian penuh (migrate + boot server) tidak bisa dijalankan di
+sandbox pengembangan ini karena tidak ada akses jaringan ke Packagist.
+Sudah divalidasi: php -l pada semua file PHP yang diubah, kecocokan nama
+rute di semua view, dan review manual terhadap konvensi Laravel 11 yang
+dipakai proyek ini (facade diimpor eksplisit, bukan alias global).
+Mohon jalankan `docker compose up --build` atau uji di preview/staging
+sebelum merge ke main.
+---
+ README.md                                     |  53 ++++++---
+ .../app/Console/Commands/EnsureAdminUser.php  |   2 +
+ .../app/Http/Controllers/AuthController.php   |  22 +++-
+ .../Http/Controllers/DashboardController.php  |  24 +++-
+ .../Controllers/JplLocationController.php     |  32 ++++++
+ .../app/Http/Controllers/UserController.php   |  90 +++++++++++++++
+ .../app/Http/Middleware/EnsureUserIsAdmin.php |  31 +++++
+ laravel-app/app/Models/JplLocation.php        |  14 +++
+ laravel-app/app/Models/User.php               |   8 ++
+ laravel-app/bootstrap/app.php                 |   6 +
+ ...000_add_role_and_active_to_users_table.php |  31 +++++
+ ...01_add_cctv_url_to_jpl_locations_table.php |  28 +++++
+ .../resources/views/dashboard/_tabs.blade.php |  10 ++
+ .../{index.blade.php => offline.blade.php}    |   4 +-
+ .../views/dashboard/online.blade.php          |  72 ++++++++++++
+ .../resources/views/layouts/app.blade.php     |  31 ++++-
+ .../resources/views/locations/index.blade.php |  34 +++++-
+ .../resources/views/users/index.blade.php     | 108 ++++++++++++++++++
+ laravel-app/routes/web.php                    |  31 ++++-
+ 19 files changed, 597 insertions(+), 34 deletions(-)
+ create mode 100644 laravel-app/app/Http/Controllers/UserController.php
+ create mode 100644 laravel-app/app/Http/Middleware/EnsureUserIsAdmin.php
+ create mode 100644 laravel-app/database/migrations/2026_08_19_000000_add_role_and_active_to_users_table.php
+ create mode 100644 laravel-app/database/migrations/2026_08_19_000001_add_cctv_url_to_jpl_locations_table.php
+ create mode 100644 laravel-app/resources/views/dashboard/_tabs.blade.php
+ rename laravel-app/resources/views/dashboard/{index.blade.php => offline.blade.php} (98%)
+ create mode 100644 laravel-app/resources/views/dashboard/online.blade.php
+ create mode 100644 laravel-app/resources/views/users/index.blade.php
+
+diff --git a/README.md b/README.md
+index 008aa26..75e70dc 100644
+--- a/README.md
++++ b/README.md
+@@ -21,11 +21,15 @@ on-site dekat JPL, tanpa internet setelah image dibangun) maupun **online**
+   serta overlay nama lokasi JPL + timestamp pada video hasil.
+ - **Multi-lokasi JPL** — setiap video terhubung ke satu lokasi JPL terdaftar;
+   dashboard menampilkan ringkasan & riwayat per lokasi.
+-- **Dashboard & laporan historis** — ringkasan total video/objek/safety event,
+-  filter berdasarkan lokasi & rentang tanggal, dan **export CSV**.
+-- **Login** — seluruh halaman (kecuali endpoint callback dari detector-service)
+-  dilindungi otentikasi; akun dibuat lewat environment variable, bukan
+-  registrasi publik.
++- **Dashboard Offline & laporan historis** — ringkasan total video/objek/safety
++  event, filter berdasarkan lokasi & rentang tanggal, dan **export CSV**.
++- **Dashboard Online** — tayangan CCTV langsung per lokasi JPL, aktif begitu
++  Administrator mengisi URL CCTV (HLS/MP4/embed) lewat menu Lokasi JPL.
++- **Login & role pengguna** — seluruh halaman (kecuali endpoint callback dari
++  detector-service) dilindungi otentikasi. Dua role: **Administrator** (akses
++  penuh: Unggah Video, Lokasi JPL, Kelola Pengguna) dan **User** (hanya bisa
++  membuka menu Dashboard, baik Online maupun Offline). Lihat bagian
++  "Login, akun admin & manajemen pengguna" di bawah.
+ - Kelas objek yang dideteksi: **person, bicycle, car, motorcycle, bus, truck**.
+ 
+ ## Arsitektur
+@@ -84,21 +88,34 @@ Setelah semua container jalan:
+ - **http://localhost:8000/locations** — kelola daftar lokasi JPL.
+ - Service detector bisa dicek langsung di **http://localhost:8001/health**.
+ 
+-## Login & akun admin
++## Login, akun admin & manajemen pengguna
+ 
+-Tidak ada halaman registrasi publik — akun dibuat/diperbarui otomatis setiap
+-container `app`/`queue` start, berdasarkan environment variable:
++Tidak ada halaman registrasi publik. Satu akun Administrator awal
++dibuat/diperbarui otomatis setiap container `app`/`queue` start, berdasarkan
++environment variable:
+ 
+ - `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `ADMIN_NAME` (opsional, default "Administrator").
+ 
+ Kalau kedua variable itu tidak diset, tidak ada akun yang dibuat/diubah
+-(command `sigap:ensure-admin` dilewati). Untuk mengganti password akun yang
+-sudah ada, cukup ubah `ADMIN_PASSWORD` lalu restart/redeploy container — akun
+-dengan email yang sama akan diperbarui passwordnya (bukan dibuat akun baru).
+-
+-Ingin lebih dari satu akun bernama per anggota tim (bukan satu akun admin
+-bersama)? Ini bisa ditambahkan sebagai halaman manajemen user terpisah —
+-tinggal minta kalau diperlukan.
++(command `sigap:ensure-admin` dilewati). Untuk mengganti password akun ini,
++cukup ubah `ADMIN_PASSWORD` lalu restart/redeploy container — akun dengan
++email yang sama akan diperbarui passwordnya (bukan dibuat akun baru). Akun
++ini selalu diberi role `admin` dan status aktif oleh `sigap:ensure-admin`,
++jadi tidak akan pernah terkunci keluar meski di-nonaktifkan lewat menu
++Kelola Pengguna.
++
++Untuk akun-akun lain (anggota tim yang hanya perlu memantau Dashboard, atau
++Administrator tambahan), login sebagai Administrator lalu buka menu
++**Kelola Pengguna** untuk menambah, menonaktifkan, reset password, atau
++menghapus akun. Ada dua role:
++
++- **admin** — akses penuh: Unggah Video, Lokasi JPL, Kelola Pengguna, plus
++  kedua Dashboard.
++- **user** — hanya menu Dashboard (Online & Offline); mencoba membuka URL
++  halaman admin secara langsung akan otomatis diarahkan balik ke Dashboard.
++
++Sistem selalu menjaga agar minimal ada satu akun Administrator aktif — akun
++admin terakhir tidak bisa dinonaktifkan/dihapus lewat menu Kelola Pengguna.
+ 
+ ## Cara pakai
+ 
+@@ -118,6 +135,12 @@ tinggal minta kalau diperlukan.
+    - Video hasil deteksi (kotak pembatas + ID + jejak lintasan + zona + overlay lokasi/waktu).
+    - Grafik & tabel rincian jumlah per kelas objek per zona.
+    - Daftar **safety event** (objek yang diam di zona bahaya) lengkap foto bukti.
++7. (Opsional) Di **/locations**, isi kolom URL CCTV pada lokasi yang sudah
++   punya kamera live — lokasi itu langsung muncul di **Dashboard Online**
++   untuk semua pengguna.
++8. Bagikan akun dengan role **user** (dibuat lewat menu Kelola Pengguna)
++   kepada anggota tim yang hanya perlu memantau **Dashboard** — mereka tidak
++   melihat menu Unggah Video/Lokasi JPL/Kelola Pengguna sama sekali.
+ 
+ ## Deploy ke VPS via Coolify
+ 
+diff --git a/laravel-app/app/Console/Commands/EnsureAdminUser.php b/laravel-app/app/Console/Commands/EnsureAdminUser.php
+index 86150ef..0687934 100644
+--- a/laravel-app/app/Console/Commands/EnsureAdminUser.php
++++ b/laravel-app/app/Console/Commands/EnsureAdminUser.php
+@@ -32,6 +32,8 @@ class EnsureAdminUser extends Command
+             [
+                 'name' => env('ADMIN_NAME', 'Administrator'),
+                 'password' => $password,
++                'role' => 'admin',
++                'is_active' => true,
+             ]
+         );
+ 
+diff --git a/laravel-app/app/Http/Controllers/AuthController.php b/laravel-app/app/Http/Controllers/AuthController.php
+index 2210bf4..1d18f8e 100644
+--- a/laravel-app/app/Http/Controllers/AuthController.php
++++ b/laravel-app/app/Http/Controllers/AuthController.php
+@@ -10,7 +10,7 @@ class AuthController extends Controller
+     public function showLogin()
+     {
+         if (Auth::check()) {
+-            return redirect()->route('videos.index');
++            return redirect()->to($this->homeUrlFor(Auth::user()));
+         }
+ 
+         return view('auth.login');
+@@ -33,9 +33,27 @@ class AuthController extends Controller
+                 ->onlyInput('email');
+         }
+ 
++        if (! Auth::user()->is_active) {
++            Auth::logout();
++
++            return back()
++                ->withErrors(['email' => 'Akun ini sudah dinonaktifkan. Hubungi Administrator.'])
++                ->onlyInput('email');
++        }
++
+         $request->session()->regenerate();
+ 
+-        return redirect()->intended(route('videos.index'));
++        return redirect()->intended($this->homeUrlFor(Auth::user()));
++    }
++
++    /**
++     * Halaman utama setelah login: Administrator ke halaman Unggah Video,
++     * user biasa ke Dashboard Online (mereka tidak punya menu Dashboard di
++     * navbar admin, jadi tidak boleh diarahkan ke rute khusus admin).
++     */
++    private function homeUrlFor($user): string
++    {
++        return $user->isAdmin() ? route('videos.index') : route('dashboard.online');
+     }
+ 
+     public function logout(Request $request)
+diff --git a/laravel-app/app/Http/Controllers/DashboardController.php b/laravel-app/app/Http/Controllers/DashboardController.php
+index 19384b7..61e3c52 100644
+--- a/laravel-app/app/Http/Controllers/DashboardController.php
++++ b/laravel-app/app/Http/Controllers/DashboardController.php
+@@ -42,7 +42,29 @@ class DashboardController extends Controller
+             'total_objects' => (int) CountResult::sum('count'),
+         ];
+ 
+-        return view('dashboard.index', compact('videos', 'locations', 'summary'));
++        return view('dashboard.offline', compact('videos', 'locations', 'summary'));
++    }
++
++    /**
++     * Dashboard Online: daftar lokasi JPL yang sudah diisi URL CCTV oleh
++     * Administrator (lihat JplLocationController::updateCctv), plus tayangan
++     * CCTV untuk lokasi yang dipilih.
++     */
++    public function online(Request $request)
++    {
++        $locations = JplLocation::whereNotNull('cctv_url')->orderBy('name')->get();
++        $totalLocations = JplLocation::count();
++
++        $selected = null;
++        if ($request->filled('lokasi')) {
++            $selected = $locations->firstWhere('id', $request->integer('lokasi'));
++        }
++
++        return view('dashboard.online', [
++            'locations' => $locations,
++            'totalLocations' => $totalLocations,
++            'selected' => $selected,
++        ]);
+     }
+ 
+     public function export(Request $request)
+diff --git a/laravel-app/app/Http/Controllers/JplLocationController.php b/laravel-app/app/Http/Controllers/JplLocationController.php
+index bbf93ce..1ea744d 100644
+--- a/laravel-app/app/Http/Controllers/JplLocationController.php
++++ b/laravel-app/app/Http/Controllers/JplLocationController.php
+@@ -37,4 +37,36 @@ class JplLocationController extends Controller
+ 
+         return redirect()->route('locations.index')->with('status', 'Lokasi JPL berhasil ditambahkan.');
+     }
++
++    /**
++     * Mengisi/mengubah/menghapus URL CCTV lokasi -- ini yang mengaktifkan
++     * (atau menonaktifkan) Dashboard Online untuk lokasi tersebut.
++     */
++    public function updateCctv(Request $request, JplLocation $location)
++    {
++        $validated = $request->validate([
++            'cctv_url' => ['nullable', 'string', 'max:2048'],
++        ]);
++
++        $url = trim($validated['cctv_url'] ?? '');
++
++        $location->update([
++            'cctv_url' => $url !== '' ? $url : null,
++            'cctv_added_at' => $url !== '' ? now() : null,
++        ]);
++
++        return redirect()->route('locations.index')->with(
++            'status',
++            $url !== ''
++                ? 'URL CCTV disimpan. Dashboard Online kini aktif untuk lokasi ini.'
++                : 'URL CCTV dihapus. Dashboard Online untuk lokasi ini dinonaktifkan.'
++        );
++    }
++
++    public function destroy(JplLocation $location)
++    {
++        $location->delete();
++
++        return redirect()->route('locations.index')->with('status', 'Lokasi JPL dihapus.');
++    }
+ }
+diff --git a/laravel-app/app/Http/Controllers/UserController.php b/laravel-app/app/Http/Controllers/UserController.php
+new file mode 100644
+index 0000000..f44c529
+--- /dev/null
++++ b/laravel-app/app/Http/Controllers/UserController.php
+@@ -0,0 +1,90 @@
++<?php
++
++namespace App\Http\Controllers;
++
++use App\Models\User;
++use Illuminate\Http\Request;
++use Illuminate\Validation\Rule;
++use Illuminate\Validation\Rules\Password;
++
++class UserController extends Controller
++{
++    public function index()
++    {
++        $users = User::orderByDesc('created_at')->get();
++
++        return view('users.index', compact('users'));
++    }
++
++    public function store(Request $request)
++    {
++        $validated = $request->validate([
++            'name' => ['required', 'string', 'max:255'],
++            'email' => ['required', 'email', 'max:255', 'unique:users,email'],
++            'password' => ['required', 'string', Password::min(6)],
++            'role' => ['required', Rule::in(['admin', 'user'])],
++        ], [
++            'email.unique' => 'Email ini sudah dipakai pengguna lain.',
++            'password.min' => 'Password minimal 6 karakter.',
++        ]);
++
++        User::create([
++            'name' => $validated['name'],
++            'email' => $validated['email'],
++            'password' => $validated['password'],
++            'role' => $validated['role'],
++            'is_active' => true,
++        ]);
++
++        return redirect()->route('users.index')->with('status', 'Pengguna baru berhasil ditambahkan.');
++    }
++
++    public function toggle(User $user)
++    {
++        if ($user->id === auth()->id()) {
++            return redirect()->route('users.index')->withErrors(['user' => 'Anda tidak bisa menonaktifkan akun Anda sendiri.']);
++        }
++
++        if ($user->isAdmin() && $user->is_active) {
++            $activeAdmins = User::where('role', 'admin')->where('is_active', true)->count();
++            if ($activeAdmins <= 1) {
++                return redirect()->route('users.index')->withErrors(['user' => 'Tidak bisa menonaktifkan satu-satunya Administrator aktif.']);
++            }
++        }
++
++        $user->update(['is_active' => ! $user->is_active]);
++
++        return redirect()->route('users.index')->with('status', 'Status pengguna diperbarui.');
++    }
++
++    public function resetPassword(Request $request, User $user)
++    {
++        $validated = $request->validate([
++            'password' => ['required', 'string', Password::min(6)],
++        ], [
++            'password.min' => 'Password baru minimal 6 karakter.',
++        ]);
++
++        $user->update(['password' => $validated['password']]);
++
++        return redirect()->route('users.index')->with('status', "Password untuk {$user->email} berhasil direset.");
++    }
++
++    public function destroy(User $user)
++    {
++        if ($user->id === auth()->id()) {
++            return redirect()->route('users.index')->withErrors(['user' => 'Anda tidak bisa menghapus akun Anda sendiri.']);
++        }
++
++        if ($user->isAdmin()) {
++            $adminCount = User::where('role', 'admin')->count();
++            if ($adminCount <= 1) {
++                return redirect()->route('users.index')->withErrors(['user' => 'Tidak bisa menghapus satu-satunya Administrator.']);
++            }
++        }
++
++        $user->delete();
++
++        return redirect()->route('users.index')->with('status', 'Pengguna dihapus.');
++    }
++}
+diff --git a/laravel-app/app/Http/Middleware/EnsureUserIsAdmin.php b/laravel-app/app/Http/Middleware/EnsureUserIsAdmin.php
+new file mode 100644
+index 0000000..4b02c5d
+--- /dev/null
++++ b/laravel-app/app/Http/Middleware/EnsureUserIsAdmin.php
+@@ -0,0 +1,31 @@
++<?php
++
++namespace App\Http\Middleware;
++
++use Closure;
++use Illuminate\Http\Request;
++use Symfony\Component\HttpFoundation\Response;
++
++/**
++ * Membatasi halaman Unggah Video, Lokasi JPL, dan Kelola Pengguna hanya untuk
++ * role 'admin'. Dipasang SETELAH middleware 'auth', jadi saat middleware ini
++ * jalan, user pasti sudah login.
++ *
++ * Kalau user biasa (role 'user') mencoba membuka halaman admin, kita arahkan
++ * balik ke Dashboard mereka (bukan tampilkan halaman 403 polos) supaya
++ * pengalamannya tetap mulus -- ini juga otomatis menangani kasus user biasa
++ * membuka "/" (yang sebenarnya adalah halaman Unggah Video khusus admin).
++ */
++class EnsureUserIsAdmin
++{
++    public function handle(Request $request, Closure $next): Response
++    {
++        if (! $request->user() || ! $request->user()->isAdmin()) {
++            return redirect()
++                ->route('dashboard.online')
++                ->with('error', 'Anda tidak memiliki akses ke halaman tersebut. Hubungi Administrator jika diperlukan.');
++        }
++
++        return $next($request);
++    }
++}
+diff --git a/laravel-app/app/Models/JplLocation.php b/laravel-app/app/Models/JplLocation.php
+index a5311b7..f52d9b2 100644
+--- a/laravel-app/app/Models/JplLocation.php
++++ b/laravel-app/app/Models/JplLocation.php
+@@ -12,6 +12,12 @@ class JplLocation extends Model
+         'name',
+         'km_position',
+         'description',
++        'cctv_url',
++        'cctv_added_at',
++    ];
++
++    protected $casts = [
++        'cctv_added_at' => 'datetime',
+     ];
+ 
+     public function videos(): HasMany
+@@ -19,6 +25,14 @@ class JplLocation extends Model
+         return $this->hasMany(Video::class);
+     }
+ 
++    /**
++     * Lokasi ini muncul di Dashboard Online begitu Administrator mengisi URL CCTV.
++     */
++    public function hasOnlineCctv(): bool
++    {
++        return ! empty($this->cctv_url);
++    }
++
+     /**
+      * Jumlah total safety event di semua video pada lokasi ini (untuk ringkasan dashboard).
+      */
+diff --git a/laravel-app/app/Models/User.php b/laravel-app/app/Models/User.php
+index 5c9794a..6cc942f 100644
+--- a/laravel-app/app/Models/User.php
++++ b/laravel-app/app/Models/User.php
+@@ -13,6 +13,8 @@ class User extends Authenticatable
+         'name',
+         'email',
+         'password',
++        'role',
++        'is_active',
+     ];
+ 
+     protected $hidden = [
+@@ -22,5 +24,11 @@ class User extends Authenticatable
+ 
+     protected $casts = [
+         'password' => 'hashed',
++        'is_active' => 'boolean',
+     ];
++
++    public function isAdmin(): bool
++    {
++        return $this->role === 'admin';
++    }
+ }
+diff --git a/laravel-app/bootstrap/app.php b/laravel-app/bootstrap/app.php
+index 22ff4a7..461764e 100644
+--- a/laravel-app/bootstrap/app.php
++++ b/laravel-app/bootstrap/app.php
+@@ -29,6 +29,12 @@ return Application::configure(basePath: dirname(__DIR__))
+         $middleware->validateCsrfTokens(except: [
+             'api/*',
+         ]);
++
++        // Alias 'admin' -- membatasi rute khusus Administrator (Unggah Video,
++        // Lokasi JPL, Kelola Pengguna). Lihat App\Http\Middleware\EnsureUserIsAdmin.
++        $middleware->alias([
++            'admin' => \App\Http\Middleware\EnsureUserIsAdmin::class,
++        ]);
+     })
+     ->withExceptions(function (Exceptions $exceptions) {
+         //
+diff --git a/laravel-app/database/migrations/2026_08_19_000000_add_role_and_active_to_users_table.php b/laravel-app/database/migrations/2026_08_19_000000_add_role_and_active_to_users_table.php
+new file mode 100644
+index 0000000..dd20a1e
+--- /dev/null
++++ b/laravel-app/database/migrations/2026_08_19_000000_add_role_and_active_to_users_table.php
+@@ -0,0 +1,31 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    public function up(): void
++    {
++        Schema::table('users', function (Blueprint $table) {
++            // 'admin' bisa mengelola lokasi JPL, mengunggah video, dan mengelola
++            // pengguna. 'user' hanya bisa melihat menu Dashboard (Online & Offline).
++            $table->string('role')->default('user')->after('password');
++            $table->boolean('is_active')->default(true)->after('role');
++        });
++
++        // Akun yang sudah ada sebelum migrasi ini (mis. akun admin default yang
++        // dibuat lewat sigap:ensure-admin) dianggap admin, supaya tidak ada yang
++        // tiba-tiba terkunci dari halaman yang sebelumnya bisa mereka akses.
++        DB::table('users')->update(['role' => 'admin']);
++    }
++
++    public function down(): void
++    {
++        Schema::table('users', function (Blueprint $table) {
++            $table->dropColumn(['role', 'is_active']);
++        });
++    }
++};
+diff --git a/laravel-app/database/migrations/2026_08_19_000001_add_cctv_url_to_jpl_locations_table.php b/laravel-app/database/migrations/2026_08_19_000001_add_cctv_url_to_jpl_locations_table.php
+new file mode 100644
+index 0000000..0c5b2fe
+--- /dev/null
++++ b/laravel-app/database/migrations/2026_08_19_000001_add_cctv_url_to_jpl_locations_table.php
+@@ -0,0 +1,28 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    public function up(): void
++    {
++        Schema::table('jpl_locations', function (Blueprint $table) {
++            // Diisi Administrator lewat menu Lokasi JPL. Begitu terisi, lokasi ini
++            // otomatis muncul di Dashboard Online untuk role 'user'. Tautan yang
++            // didukung: HLS (.m3u8), MP4 langsung, atau URL embed/iframe. Stream
++            // RTSP mentah perlu di-relay ke HLS/MP4 dulu (browser tidak bisa
++            // memutar RTSP langsung).
++            $table->string('cctv_url')->nullable()->after('description');
++            $table->timestamp('cctv_added_at')->nullable()->after('cctv_url');
++        });
++    }
++
++    public function down(): void
++    {
++        Schema::table('jpl_locations', function (Blueprint $table) {
++            $table->dropColumn(['cctv_url', 'cctv_added_at']);
++        });
++    }
++};
+diff --git a/laravel-app/resources/views/dashboard/_tabs.blade.php b/laravel-app/resources/views/dashboard/_tabs.blade.php
+new file mode 100644
+index 0000000..cf9d8e7
+--- /dev/null
++++ b/laravel-app/resources/views/dashboard/_tabs.blade.php
+@@ -0,0 +1,10 @@
++<div class="flex items-center gap-6 border-b mb-6 text-sm font-medium">
++    <a href="{{ route('dashboard.online') }}"
++       class="pb-3 -mb-px border-b-2 {{ request()->routeIs('dashboard.online') ? 'border-slate-900 text-slate-900' : 'border-transparent text-slate-500 hover:text-slate-700' }}">
++        Dashboard Online
++    </a>
++    <a href="{{ route('dashboard.offline') }}"
++       class="pb-3 -mb-px border-b-2 {{ request()->routeIs('dashboard.offline') ? 'border-slate-900 text-slate-900' : 'border-transparent text-slate-500 hover:text-slate-700' }}">
++        Dashboard Offline
++    </a>
++</div>
+diff --git a/laravel-app/resources/views/dashboard/index.blade.php b/laravel-app/resources/views/dashboard/offline.blade.php
+similarity index 98%
+rename from laravel-app/resources/views/dashboard/index.blade.php
+rename to laravel-app/resources/views/dashboard/offline.blade.php
+index f89051e..00b7a90 100644
+--- a/laravel-app/resources/views/dashboard/index.blade.php
++++ b/laravel-app/resources/views/dashboard/offline.blade.php
+@@ -1,8 +1,10 @@
+ @extends('layouts.app')
+ 
+-@section('title', 'SIGAP-JPL — Dashboard')
++@section('title', 'SIGAP-JPL — Dashboard Offline')
+ 
+ @section('content')
++@include('dashboard._tabs')
++
+ <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+     <div class="bg-white rounded-xl shadow p-4">
+         <div class="text-xs text-slate-500">Total Video</div>
+diff --git a/laravel-app/resources/views/dashboard/online.blade.php b/laravel-app/resources/views/dashboard/online.blade.php
+new file mode 100644
+index 0000000..36a8363
+--- /dev/null
++++ b/laravel-app/resources/views/dashboard/online.blade.php
+@@ -0,0 +1,72 @@
++@extends('layouts.app')
++
++@section('title', 'SIGAP-JPL — Dashboard Online')
++
++@section('content')
++@include('dashboard._tabs')
++
++<p class="text-sm text-slate-500 mb-6">Pantau lokasi JPL secara langsung. Lokasi akan muncul di sini setelah Administrator mengisi URL CCTV lewat menu Lokasi JPL.</p>
++
++@if ($locations->isEmpty())
++    <div class="bg-white rounded-xl shadow p-10 text-center text-slate-500">
++        <p class="text-lg mb-1">Belum ada CCTV online</p>
++        <p class="text-sm">
++            @if ($totalLocations === 0)
++                Administrator belum menambahkan lokasi JPL sama sekali.
++            @else
++                Administrator belum mengisi URL CCTV untuk lokasi manapun.
++            @endif
++        </p>
++    </div>
++@else
++    <div class="grid gap-8 lg:grid-cols-2">
++        <div class="bg-white rounded-xl shadow p-6">
++            <h2 class="text-lg font-semibold mb-4">Lokasi Online ({{ $locations->count() }})</h2>
++            <div class="space-y-3">
++                @foreach ($locations as $location)
++                    <div class="rounded-lg border p-3 {{ $selected && $selected->id === $location->id ? 'border-slate-900 ring-1 ring-slate-900' : '' }}">
++                        <div class="flex items-center justify-between">
++                            <span class="font-medium">{{ $location->code }} — {{ $location->name }}</span>
++                            <span class="text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-800">Live</span>
++                        </div>
++                        <a href="{{ route('dashboard.online', ['lokasi' => $location->id]) }}"
++                           class="inline-block mt-2 text-xs bg-slate-100 hover:bg-slate-200 rounded-lg px-3 py-1.5 font-medium">
++                            Lihat CCTV
++                        </a>
++                    </div>
++                @endforeach
++            </div>
++        </div>
++
++        <div class="bg-white rounded-xl shadow p-6">
++            <h2 class="text-lg font-semibold mb-4">Tayangan CCTV</h2>
++            @if (! $selected)
++                <p class="text-sm text-slate-500">Pilih salah satu lokasi di sebelah kiri untuk menampilkan tayangan CCTV.</p>
++            @else
++                <p class="text-sm text-slate-500 mb-3">
++                    {{ $selected->name }}
++                    @if ($selected->cctv_added_at)
++                        · sejak {{ $selected->cctv_added_at->format('d M Y H:i') }}
++                    @endif
++                </p>
++
++                @if (preg_match('/\.(m3u8|mp4)(\?|$)/i', $selected->cctv_url))
++                    <div class="relative w-full bg-black rounded-lg overflow-hidden">
++                        <video src="{{ $selected->cctv_url }}" controls autoplay muted playsinline class="w-full block"></video>
++                    </div>
++                @else
++                    <div class="relative w-full bg-black rounded-lg overflow-hidden" style="aspect-ratio: 16 / 9;">
++                        <iframe src="{{ $selected->cctv_url }}" class="w-full h-full border-0" allowfullscreen></iframe>
++                    </div>
++                @endif
++
++                <p class="text-xs text-slate-400 mt-3 break-all">Sumber: {{ $selected->cctv_url }}</p>
++                <p class="text-xs text-slate-400 mt-2">
++                    Catatan: mendukung tautan streaming HLS/MP4 langsung atau tautan embed (iframe). Stream RTSP mentah
++                    perlu di-relay ke HLS/MP4 terlebih dahulu agar dapat diputar di browser.
++                </p>
++            @endif
++        </div>
++    </div>
++@endif
++@endsection
+diff --git a/laravel-app/resources/views/layouts/app.blade.php b/laravel-app/resources/views/layouts/app.blade.php
+index 2d52705..cbcce13 100644
+--- a/laravel-app/resources/views/layouts/app.blade.php
++++ b/laravel-app/resources/views/layouts/app.blade.php
+@@ -7,20 +7,36 @@
+     <script src="https://cdn.tailwindcss.com"></script>
+ </head>
+ <body class="bg-slate-100 min-h-screen text-slate-800">
++    @php $isAdmin = auth()->check() && auth()->user()->isAdmin(); @endphp
+     <nav class="bg-slate-900 text-white px-6 py-4 flex items-center justify-between flex-wrap gap-3">
+         <div class="flex items-center gap-6">
+-            <a href="{{ route('videos.index') }}" class="font-semibold text-lg">SIGAP-JPL</a>
++            <a href="{{ $isAdmin ? route('videos.index') : route('dashboard.online') }}" class="font-semibold text-lg">SIGAP-JPL</a>
+             <div class="flex items-center gap-4 text-sm text-slate-300">
+-                <a href="{{ route('videos.index') }}" class="hover:text-white">Unggah Video</a>
+-                <a href="{{ route('dashboard.index') }}" class="hover:text-white">Dashboard</a>
+-                <a href="{{ route('locations.index') }}" class="hover:text-white">Lokasi JPL</a>
++                @if ($isAdmin)
++                    <a href="{{ route('videos.index') }}" class="hover:text-white {{ request()->routeIs('videos.index') ? 'text-white' : '' }}">Unggah Video</a>
++                    <a href="{{ route('locations.index') }}" class="hover:text-white {{ request()->routeIs('locations.*') ? 'text-white' : '' }}">Lokasi JPL</a>
++                    <a href="{{ route('users.index') }}" class="hover:text-white {{ request()->routeIs('users.*') ? 'text-white' : '' }}">Kelola Pengguna</a>
++                @else
++                    <div class="relative group">
++                        <button type="button" class="hover:text-white {{ request()->routeIs('dashboard.*') ? 'text-white' : '' }} flex items-center gap-1">
++                            Dashboard
++                            <svg class="w-3 h-3" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd" /></svg>
++                        </button>
++                        <div class="absolute left-0 top-full pt-2 hidden group-hover:block z-10">
++                            <div class="bg-white text-slate-800 rounded-lg shadow-lg py-1 w-52 text-sm">
++                                <a href="{{ route('dashboard.online') }}" class="block px-4 py-2 hover:bg-slate-100">Dashboard Online</a>
++                                <a href="{{ route('dashboard.offline') }}" class="block px-4 py-2 hover:bg-slate-100">Dashboard Offline</a>
++                            </div>
++                        </div>
++                    </div>
++                @endif
+             </div>
+         </div>
+         <div class="flex items-center gap-4">
+             <span class="text-xs text-slate-400 hidden md:inline">Sistem Informasi &amp; Grafis Analisis Perlintasan — Proyek SRRL</span>
+             @auth
+                 <div class="flex items-center gap-3 text-sm">
+-                    <span class="text-slate-300">{{ auth()->user()->name }}</span>
++                    <span class="text-slate-300">{{ auth()->user()->name }} · {{ $isAdmin ? 'Administrator' : 'User' }}</span>
+                     <form action="{{ route('logout') }}" method="POST">
+                         @csrf
+                         <button type="submit" class="text-slate-300 hover:text-white underline">Keluar</button>
+@@ -36,6 +52,11 @@
+                 {{ session('status') }}
+             </div>
+         @endif
++        @if (session('error'))
++            <div class="mb-6 rounded-lg bg-red-100 text-red-800 px-4 py-3 text-sm">
++                {{ session('error') }}
++            </div>
++        @endif
+ 
+         @yield('content')
+     </main>
+diff --git a/laravel-app/resources/views/locations/index.blade.php b/laravel-app/resources/views/locations/index.blade.php
+index fa27671..e5ba214 100644
+--- a/laravel-app/resources/views/locations/index.blade.php
++++ b/laravel-app/resources/views/locations/index.blade.php
+@@ -41,19 +41,43 @@
+ 
+     <div class="bg-white rounded-xl shadow p-6">
+         <h2 class="text-lg font-semibold mb-4">Daftar Lokasi JPL</h2>
++        <p class="text-xs text-slate-500 mb-4">Isi URL CCTV untuk mengaktifkan Dashboard Online lokasi tersebut. Dashboard Offline aktif otomatis begitu ada video yang diunggah.</p>
+         <div class="space-y-3">
+             @forelse ($locations as $location)
+                 <div class="rounded-lg border p-3">
+-                    <div class="flex items-center justify-between">
++                    <div class="flex items-center justify-between flex-wrap gap-2">
+                         <span class="font-medium">{{ $location->code }} — {{ $location->name }}</span>
+-                        @if ($location->safety_event_count > 0)
+-                            <span class="text-xs px-2 py-0.5 rounded-full bg-red-100 text-red-800">{{ $location->safety_event_count }} safety event</span>
+-                        @endif
++                        <div class="flex items-center gap-2">
++                            @if ($location->safety_event_count > 0)
++                                <span class="text-xs px-2 py-0.5 rounded-full bg-red-100 text-red-800">{{ $location->safety_event_count }} safety event</span>
++                            @endif
++                            <span class="text-xs px-2 py-0.5 rounded-full {{ $location->cctv_url ? 'bg-green-100 text-green-800' : 'bg-slate-100 text-slate-600' }}">
++                                {{ $location->cctv_url ? 'Online aktif' : 'Online belum diatur' }}
++                            </span>
++                            <span class="text-xs px-2 py-0.5 rounded-full {{ $location->videos_count > 0 ? 'bg-green-100 text-green-800' : 'bg-slate-100 text-slate-600' }}">
++                                {{ $location->videos_count > 0 ? 'Offline aktif ('.$location->videos_count.' video)' : 'Offline belum ada video' }}
++                            </span>
++                        </div>
+                     </div>
+                     @if ($location->km_position)
+                         <div class="text-xs text-slate-400 mt-1">{{ $location->km_position }}</div>
+                     @endif
+-                    <div class="text-xs text-slate-400 mt-1">{{ $location->videos_count }} video diproses</div>
++
++                    <form action="{{ route('locations.cctv', $location) }}" method="POST" class="flex items-center gap-2 mt-3">
++                        @csrf
++                        <input type="text" name="cctv_url" value="{{ $location->cctv_url }}"
++                               placeholder="https://... (HLS/MP4/embed) atau rtsp://... setelah di-relay"
++                               class="flex-1 text-sm border rounded-lg p-2">
++                        <button type="submit" class="text-xs bg-slate-100 hover:bg-slate-200 rounded-lg px-3 py-2 font-medium whitespace-nowrap">Simpan URL</button>
++                    </form>
++
++                    <form action="{{ route('locations.destroy', $location) }}" method="POST"
++                          class="mt-2"
++                          onsubmit="return confirm('Hapus lokasi {{ $location->name }}? Video yang sudah diunggah tidak ikut terhapus, hanya kehilangan tautan lokasinya.');">
++                        @csrf
++                        @method('DELETE')
++                        <button type="submit" class="text-xs text-red-600 underline">Hapus Lokasi</button>
++                    </form>
+                 </div>
+             @empty
+                 <p class="text-sm text-slate-500">Belum ada lokasi JPL terdaftar.</p>
+diff --git a/laravel-app/resources/views/users/index.blade.php b/laravel-app/resources/views/users/index.blade.php
+new file mode 100644
+index 0000000..f19ef9e
+--- /dev/null
++++ b/laravel-app/resources/views/users/index.blade.php
+@@ -0,0 +1,108 @@
++@extends('layouts.app')
++
++@section('title', 'SIGAP-JPL — Kelola Pengguna')
++
++@section('content')
++<div class="grid gap-8 md:grid-cols-2">
++    <div class="bg-white rounded-xl shadow p-6 md:order-2">
++        <h1 class="text-xl font-semibold mb-1">Tambah Pengguna Baru</h1>
++        <p class="text-sm text-slate-500 mb-4">Pengguna dengan role "User" hanya dapat mengakses menu Dashboard (Online &amp; Offline).</p>
++
++        @if ($errors->any())
++            <div class="mb-4 rounded-lg bg-red-100 text-red-800 px-4 py-3 text-sm">
++                <ul class="list-disc list-inside">
++                    @foreach ($errors->all() as $error)
++                        <li>{{ $error }}</li>
++                    @endforeach
++                </ul>
++            </div>
++        @endif
++
++        <form action="{{ route('users.store') }}" method="POST" class="space-y-3">
++            @csrf
++            <div>
++                <label class="block text-sm font-medium mb-1">Nama Lengkap</label>
++                <input type="text" name="name" value="{{ old('name') }}" class="w-full text-sm border rounded-lg p-2" required>
++            </div>
++            <div>
++                <label class="block text-sm font-medium mb-1">Email</label>
++                <input type="email" name="email" value="{{ old('email') }}" class="w-full text-sm border rounded-lg p-2" required>
++            </div>
++            <div>
++                <label class="block text-sm font-medium mb-1">Password</label>
++                <input type="password" name="password" minlength="6" class="w-full text-sm border rounded-lg p-2" required>
++            </div>
++            <div>
++                <label class="block text-sm font-medium mb-1">Role</label>
++                <select name="role" class="w-full text-sm border rounded-lg p-2">
++                    <option value="user">User (akses Dashboard saja)</option>
++                    <option value="admin">Administrator (akses penuh)</option>
++                </select>
++            </div>
++            <button type="submit" class="w-full bg-slate-900 text-white rounded-lg py-2.5 font-medium">Simpan Pengguna</button>
++        </form>
++    </div>
++
++    <div class="bg-white rounded-xl shadow p-6 md:order-1">
++        <h2 class="text-lg font-semibold mb-1">Daftar Pengguna</h2>
++        <p class="text-sm text-slate-500 mb-4">Total {{ $users->count() }} akun terdaftar.</p>
++
++        <div class="overflow-x-auto">
++            <table class="w-full text-sm border-collapse">
++                <thead>
++                    <tr class="text-left border-b text-xs text-slate-500 uppercase">
++                        <th class="py-2">Nama</th>
++                        <th class="py-2">Email</th>
++                        <th class="py-2">Role</th>
++                        <th class="py-2">Status</th>
++                        <th class="py-2">Aksi</th>
++                    </tr>
++                </thead>
++                <tbody>
++                    @foreach ($users as $user)
++                        <tr class="border-b align-top">
++                            <td class="py-2">{{ $user->name }}</td>
++                            <td class="py-2">{{ $user->email }}</td>
++                            <td class="py-2">
++                                <span class="text-xs px-2 py-0.5 rounded-full {{ $user->isAdmin() ? 'bg-blue-100 text-blue-800' : 'bg-slate-100 text-slate-600' }}">
++                                    {{ $user->isAdmin() ? 'Administrator' : 'User' }}
++                                </span>
++                            </td>
++                            <td class="py-2">
++                                <span class="text-xs px-2 py-0.5 rounded-full {{ $user->is_active ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800' }}">
++                                    {{ $user->is_active ? 'Aktif' : 'Nonaktif' }}
++                                </span>
++                            </td>
++                            <td class="py-2">
++                                <details class="inline-block">
++                                    <summary class="text-xs bg-slate-100 hover:bg-slate-200 rounded-lg px-2.5 py-1 font-medium cursor-pointer inline-block">Kelola</summary>
++                                    <div class="mt-2 flex flex-col gap-2 min-w-[220px]">
++                                        <form action="{{ route('users.toggle', $user) }}" method="POST">
++                                            @csrf
++                                            <button type="submit" class="w-full text-xs bg-slate-100 hover:bg-slate-200 rounded-lg px-2.5 py-1.5 font-medium">
++                                                {{ $user->is_active ? 'Nonaktifkan' : 'Aktifkan' }}
++                                            </button>
++                                        </form>
++                                        <form action="{{ route('users.reset-password', $user) }}" method="POST" class="flex gap-1">
++                                            @csrf
++                                            <input type="password" name="password" placeholder="Password baru" minlength="6" required
++                                                   class="text-xs border rounded-lg p-1.5 flex-1">
++                                            <button type="submit" class="text-xs bg-slate-100 hover:bg-slate-200 rounded-lg px-2 py-1 font-medium">Reset</button>
++                                        </form>
++                                        <form action="{{ route('users.destroy', $user) }}" method="POST"
++                                              onsubmit="return confirm('Hapus pengguna {{ $user->email }}?');">
++                                            @csrf
++                                            @method('DELETE')
++                                            <button type="submit" class="w-full text-xs bg-red-100 hover:bg-red-200 text-red-800 rounded-lg px-2.5 py-1.5 font-medium">Hapus</button>
++                                        </form>
++                                    </div>
++                                </details>
++                            </td>
++                        </tr>
++                    @endforeach
++                </tbody>
++            </table>
++        </div>
++    </div>
++</div>
++@endsection
+diff --git a/laravel-app/routes/web.php b/laravel-app/routes/web.php
+index cf44596..3b9f01b 100644
+--- a/laravel-app/routes/web.php
++++ b/laravel-app/routes/web.php
+@@ -3,6 +3,7 @@
+ use App\Http\Controllers\AuthController;
+ use App\Http\Controllers\DashboardController;
+ use App\Http\Controllers\JplLocationController;
++use App\Http\Controllers\UserController;
+ use App\Http\Controllers\VideoCallbackController;
+ use App\Http\Controllers\VideoController;
+ use Illuminate\Support\Facades\Route;
+@@ -14,19 +15,39 @@ Route::middleware('guest')->group(function () {
+ 
+ Route::post('/logout', [AuthController::class, 'logout'])->name('logout')->middleware('auth');
+ 
+-Route::middleware('auth')->group(function () {
++// Rute khusus Administrator: Unggah Video, Lokasi JPL, Kelola Pengguna.
++// User biasa yang mencoba membuka ini otomatis diarahkan ke Dashboard mereka
++// (lihat App\Http\Middleware\EnsureUserIsAdmin).
++Route::middleware(['auth', 'admin'])->group(function () {
+     Route::get('/', [VideoController::class, 'index'])->name('videos.index');
+     Route::post('/videos', [VideoController::class, 'store'])->name('videos.store');
++
++    Route::get('/locations', [JplLocationController::class, 'index'])->name('locations.index');
++    Route::post('/locations', [JplLocationController::class, 'store'])->name('locations.store');
++    Route::post('/locations/{location}/cctv', [JplLocationController::class, 'updateCctv'])->name('locations.cctv');
++    Route::delete('/locations/{location}', [JplLocationController::class, 'destroy'])->name('locations.destroy');
++
++    Route::get('/users', [UserController::class, 'index'])->name('users.index');
++    Route::post('/users', [UserController::class, 'store'])->name('users.store');
++    Route::post('/users/{user}/toggle', [UserController::class, 'toggle'])->name('users.toggle');
++    Route::post('/users/{user}/reset-password', [UserController::class, 'resetPassword'])->name('users.reset-password');
++    Route::delete('/users/{user}', [UserController::class, 'destroy'])->name('users.destroy');
++});
++
++// Rute yang bisa diakses admin maupun user biasa: melihat detail & status
++// video (dipakai dari Dashboard Offline), dan kedua halaman Dashboard.
++Route::middleware('auth')->group(function () {
+     Route::get('/videos/{video}', [VideoController::class, 'show'])->name('videos.show');
+     Route::get('/videos/{video}/status', [VideoController::class, 'status'])->name('videos.status');
+     Route::get('/videos/{video}/annotated', [VideoController::class, 'annotated'])->name('videos.annotated');
+     Route::get('/safety-events/{safetyEvent}/snapshot', [VideoController::class, 'snapshot'])->name('videos.snapshot');
+ 
+-    Route::get('/dashboard', [DashboardController::class, 'index'])->name('dashboard.index');
++    Route::get('/dashboard', function () {
++        return redirect()->route('dashboard.online');
++    })->name('dashboard.index');
++    Route::get('/dashboard/online', [DashboardController::class, 'online'])->name('dashboard.online');
++    Route::get('/dashboard/offline', [DashboardController::class, 'index'])->name('dashboard.offline');
+     Route::get('/dashboard/export', [DashboardController::class, 'export'])->name('dashboard.export');
+-
+-    Route::get('/locations', [JplLocationController::class, 'index'])->name('locations.index');
+-    Route::post('/locations', [JplLocationController::class, 'store'])->name('locations.store');
+ });
+ 
+ // Dipanggil oleh detector-service (Python) -- diamankan dengan header rahasia
+-- 
+2.43.0
+

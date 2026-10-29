@@ -1,0 +1,75 @@
+warning: in the working copy of 'detector-service/app/main.py', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/detector-service/app/main.py b/detector-service/app/main.py[m
+[1mindex 654198e..22b3638 100644[m
+[1m--- a/detector-service/app/main.py[m
+[1m+++ b/detector-service/app/main.py[m
+[36m@@ -38,6 +38,38 @@[m [mfrom .config import ([m
+ )[m
+ from .tracker import Zone, ZoneTracker, build_polygon, hex_to_bgr, track_color[m
+ [m
+[32m+[m[32m# Header User-Agent yang menyamar sebagai browser Chrome biasa -- dipakai[m
+[32m+[m[32m# untuk SEMUA pembacaan stream CCTV (snapshot maupun live terus-menerus),[m
+[32m+[m[32m# karena banyak proxy CCTV instansi (mis. ATCS pemda) menolak/membatasi[m
+[32m+[m[32m# koneksi yang tidak "terlihat" seperti request browser biasa.[m
+[32m+[m[32mBROWSER_USER_AGENT = ([m
+[32m+[m[32m    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "[m
+[32m+[m[32m    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"[m
+[32m+[m[32m)[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _open_stream_capture(url: str):[m
+[32m+[m[32m    """Buka cv2.VideoCapture ke stream live (HLS/RTSP/dll) dengan header[m
+[32m+[m[32m    User-Agent browser terpasang.[m
+[32m+[m
+[32m+[m[32m    PENTING: sebelumnya, pembacaan stream live di _run_live_detection[m
+[32m+[m[32m    memakai cv2.VideoCapture(url) POLOS tanpa User-Agent sama sekali --[m
+[32m+[m[32m    beda dengan _capture_snapshot() di bawah yang sudah lebih dulu memakai[m
+[32m+[m[32m    ffmpeg dengan User-Agent Chrome, justru karena proxy CCTV instansi[m
+[32m+[m[32m    (mis. ATCS pemda) diketahui menolak/membatasi koneksi tanpa User-Agent[m
+[32m+[m[32m    browser (lihat komentar di _capture_snapshot). Ini kemungkinan besar[m
+[32m+[m[32m    penyebab pembacaan stream live sering gagal/gagal terus-menerus di[m
+[32m+[m[32m    tengah sesi (perlu sambung ulang berkali-kali) walau kamera & jaringan[m
+[32m+[m[32m    baik-baik saja: proxy-nya menganggap koneksi dari OpenCV/FFmpeg polos[m
+[32m+[m[32m    sebagai bot dan memblokir/membatasinya. OPENCV_FFMPEG_CAPTURE_OPTIONS[m
+[32m+[m[32m    adalah cara OpenCV (backend FFmpeg) menerima opsi tambahan seperti[m
+[32m+[m[32m    User-Agent -- dibaca ulang setiap kali VideoCapture dibuka, jadi aman[m
+[32m+[m[32m    dipakai di sini maupun saat sambung ulang.[m
+[32m+[m[32m    """[m
+[32m+[m[32m    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"user_agent;{BROWSER_USER_AGENT}"[m
+[32m+[m[32m    return cv2.VideoCapture(url)[m
+[32m+[m
+[32m+[m
+ app = FastAPI(title="SIGAP-JPL Detector Service")[m
+ [m
+ print(f"Loading YOLO model: {MODEL_NAME}")[m
+[36m@@ -172,11 +204,7 @@[m [mdef _capture_snapshot(url: str):[m
+     else:[m
+         # Banyak proxy CCTV instansi (mis. ATCS pemda) menolak request tanpa[m
+         # User-Agent yang terlihat seperti browser biasa (dianggap bot).[m
+[31m-        cmd += [[m
+[31m-            "-user_agent",[m
+[31m-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "[m
+[31m-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",[m
+[31m-        ][m
+[32m+[m[32m        cmd += ["-user_agent", BROWSER_USER_AGENT][m
+ [m
+     cmd += ["-i", url, "-frames:v", "1", "-q:v", "2", out_path][m
+ [m
+[36m@@ -551,7 +579,7 @@[m [mdef _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):[m
+     base_dt = _parse_recorded_at(req.start_at)[m
+     wanted_ids = [cid for cid, name in TARGET_CLASSES.items() if name in req.classes][m
+ [m
+[31m-    cap = cv2.VideoCapture(req.stream_url)[m
+[32m+[m[32m    cap = _open_stream_capture(req.stream_url)[m
+     if not cap.isOpened():[m
+         raise RuntimeError("Tidak dapat membuka stream CCTV. Periksa kembali URL-nya.")[m
+ [m
+[36m@@ -631,7 +659,7 @@[m [mdef _run_live_detection(req: ProcessLiveRequest, finish_at: datetime):[m
+                         break[m
+ [m
+                     cap.release()[m
+[31m-                    cap = cv2.VideoCapture(req.stream_url)[m
+[32m+[m[32m                    cap = _open_stream_capture(req.stream_url)[m
+                     consecutive_failures = 0[m
+                     time.sleep(1.0)[m
+                     continue[m
